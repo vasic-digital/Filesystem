@@ -88,6 +88,21 @@ func (c *Client) ReadFile(ctx context.Context, path string) (io.ReadCloser, erro
 	return file, nil
 }
 
+// OpenSeekable opens a local file with seek support for random access.
+// os.File natively supports Seek, enabling HTTP Range requests for video streaming.
+func (c *Client) OpenSeekable(ctx context.Context, path string) (client.ReadSeekCloser, error) {
+	if !c.IsConnected() {
+		return nil, fmt.Errorf("not connected")
+	}
+	fullPath := c.resolvePath(path)
+	file, err := os.Open(fullPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open local file %s: %w", fullPath, err)
+	}
+	// os.File implements Read, Seek, and Close.
+	return file, nil
+}
+
 // WriteFile writes a file to the local filesystem.
 func (c *Client) WriteFile(ctx context.Context, path string, data io.Reader) error {
 	if !c.IsConnected() {

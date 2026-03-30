@@ -19,6 +19,16 @@ type FileInfo struct {
 	Path    string
 }
 
+// ReadSeekCloser combines io.Reader, io.Seeker, and io.Closer.
+// Returned by SeekableClient.OpenSeekable for protocols that support
+// random access (SMB, local filesystem). Enables http.ServeContent to
+// handle Range requests for video seeking.
+type ReadSeekCloser interface {
+	io.Reader
+	io.Seeker
+	io.Closer
+}
+
 // Client defines the interface for filesystem operations.
 // This abstraction allows supporting multiple protocols.
 type Client interface {
@@ -44,6 +54,20 @@ type Client interface {
 	// Metadata
 	GetProtocol() string
 	GetConfig() interface{}
+}
+
+// SeekableClient is an optional extension of Client for protocols that support
+// random-access reads (e.g., SMB via smb2_lseek, local filesystem via os.File.Seek).
+// When a Client also implements SeekableClient, callers can open files with seek
+// support, enabling HTTP Range requests for video streaming.
+//
+// This follows how VLC handles SMB streaming: the SMB2 protocol natively supports
+// random access, so VLC opens the file with seek capability and reads from any offset.
+type SeekableClient interface {
+	// OpenSeekable opens a file for reading with seek support.
+	// The returned ReadSeekCloser supports Seek(offset, whence) for random access.
+	// Callers should prefer this over ReadFile when Range request support is needed.
+	OpenSeekable(ctx context.Context, path string) (ReadSeekCloser, error)
 }
 
 // StorageConfig represents the configuration for a storage backend.
