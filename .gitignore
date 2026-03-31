@@ -33,3 +33,8 @@ __debug_bin*
 # Build output
 /bin/
 /dist/
+
+# Environment files
+.env
+.env.local
+.env.*.local
