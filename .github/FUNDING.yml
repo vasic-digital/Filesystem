@@ -1,0 +1,11 @@
+# GitHub Sponsors configuration
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+
+# GitHub Sponsors - vasic-digital
+github:
+  - vasic-digital
+
+# Custom sponsorship link
+custom:
+  - "https://github.com/sponsors/vasic-digital"
+
