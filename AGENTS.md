@@ -142,3 +142,13 @@ If any script or command suggests using `sudo`:
 
 **VIOLATION OF THIS CONSTRAINT IS STRICTLY PROHIBITED.**
 
+
+### ⚠️⚠️⚠️ ABSOLUTELY MANDATORY: ZERO UNFINISHED WORK POLICY
+
+NO unfinished work, TODOs, or known issues may remain in the codebase. EVER.
+
+PROHIBITED: TODO/FIXME comments, empty implementations, silent errors, fake data, unwrap() calls that panic, empty catch blocks.
+
+REQUIRED: Fix ALL issues immediately, complete implementations before committing, proper error handling in ALL code paths, real test assertions.
+
+Quality Principle: If it is not finished, it does not ship. If it ships, it is finished.
