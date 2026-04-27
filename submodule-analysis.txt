@@ -1,0 +1,8 @@
+Commit: 59aa5b27a2a789729284e96556beaf805ca471d6
+Branch: main
+59aa5b2 fix(smb,webdav): bounded SMB dial timeout + WebDAV parent-filter path fix
+780d200 MANDATORY: Add ZERO UNFINISHED WORK POLICY to AGENTS.md
+7937437 Add GitHub Sponsors button for vasic-digital
+f17e42d security: Add mandatory NO SUDO/ROOT execution constraint
+1e49b39 feat: v2.2.0 comprehensive completion — edge tests, version alignment
+

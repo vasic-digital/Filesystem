@@ -6,11 +6,17 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"time"
 
 	"github.com/hirochachacha/go-smb2"
 
 	"digital.vasic.filesystem/pkg/client"
 )
+
+// defaultDialTimeout bounds the TCP connect phase of Connect() so
+// unreachable SMB hosts fail in 5s instead of hanging on the OS
+// default TCP timeout (~2 minutes).
+const defaultDialTimeout = 5 * time.Second
 
 // Config contains SMB connection configuration.
 type Config struct {
@@ -40,7 +46,8 @@ func NewSMBClient(config *Config) *Client {
 // Connect establishes the SMB connection.
 func (c *Client) Connect(ctx context.Context) error {
 	addr := net.JoinHostPort(c.config.Host, fmt.Sprintf("%d", c.config.Port))
-	conn, err := net.Dial("tcp", addr)
+	dialer := &net.Dialer{Timeout: defaultDialTimeout}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
 	if err != nil {
 		return fmt.Errorf("failed to connect to SMB server: %w", err)
 	}

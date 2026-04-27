@@ -262,6 +262,16 @@ func (c *Client) ListDirectory(ctx context.Context, path string) ([]*client.File
 
 	var files []*client.FileInfo
 
+	// WebDAV HREFs come back as path-only (e.g., "/webdav/") not full
+	// URLs. Compute the request-path portion of fullURL so we can
+	// filter out the parent-directory self-reference that PROPFIND
+	// always includes.
+	requestPath := fullURL
+	if u, err := url.Parse(fullURL); err == nil {
+		requestPath = u.Path
+	}
+	requestPathNoSlash := strings.TrimSuffix(requestPath, "/")
+
 	responseStr := string(bodyBytes)
 	responses := strings.Split(responseStr, "<D:response>")
 
@@ -281,7 +291,15 @@ func (c *Client) ListDirectory(ctx context.Context, path string) ([]*client.File
 		}
 		href := response[hrefStart+8 : hrefEnd]
 
-		if href == fullURL || href == strings.TrimSuffix(fullURL, "/") {
+		// Filter out the parent directory self-reference. PROPFIND
+		// with Depth: 1 always includes the queried directory itself
+		// as the first entry. Also compare against full-URL forms for
+		// servers that echo absolute hrefs.
+		hrefNoSlash := strings.TrimSuffix(href, "/")
+		if href == fullURL ||
+			href == strings.TrimSuffix(fullURL, "/") ||
+			href == requestPath ||
+			hrefNoSlash == requestPathNoSlash {
 			continue
 		}
 
