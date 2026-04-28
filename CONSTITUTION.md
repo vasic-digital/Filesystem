@@ -95,3 +95,54 @@ runbook.
 
 <!-- END host-power-management addendum (CONST-033) -->
 
+
+<!-- BEGIN anti-bluff-testing addendum (Article XI) -->
+
+## Article XI — Anti-Bluff Testing (MANDATORY)
+
+**Inherited from the umbrella project's Constitution Article XI.
+Tests and Challenges that pass without exercising real end-user
+behaviour are forbidden in this submodule too.**
+
+Every test, every Challenge, every HelixQA bank entry MUST:
+
+1. **Assert on a concrete end-user-visible outcome** — rendered DOM,
+   DB rows that a real query would return, files on disk, media that
+   actually plays, search results that actually contain expected
+   items. Not "no error" or "200 OK".
+2. **Run against the real system below the assertion.** Mocks/stubs
+   are permitted ONLY in unit tests (`*_test.go` under `go test
+   -short` or language equivalent). Integration / E2E / Challenge /
+   HelixQA tests use real containers, real databases, real
+   renderers. Unreachable real-system → skip with `SKIP-OK:
+   #<ticket>`, never silently pass.
+3. **Include a matching negative.** Every positive assertion is
+   paired with an assertion that fails when the feature is broken.
+4. **Emit copy-pasteable evidence** — body, screenshot, frame, DB
+   row, log excerpt. Boolean pass/fail is insufficient.
+5. **Verify "fails when feature is removed."** Author runs locally
+   with the feature commented out; the test MUST FAIL. If it still
+   passes, it's a bluff — delete and rewrite.
+6. **No blind shells.** No `&& echo PASS`, `|| true`, `tee` exit
+   laundering, `if [ -f file ]` without content assertion.
+
+**Challenges in this submodule** must replay the user journey
+end-to-end through the umbrella project's deliverables — never via
+raw `curl` or third-party scripts. Sub-1-second Challenges almost
+always indicate a bluff.
+
+**HelixQA banks** declare executable actions
+(`adb_shell:`, `playwright:`, `http:`, `assertVisible:`,
+`assertNotVisible:`), never prose. Stagnation guard from Article I
+§1.3 applies — frame N+1 identical to frame N for >10 s = FAIL.
+
+**PR requirement:** every PR adding/modifying a test or Challenge in
+this submodule MUST include a fenced `## Anti-Bluff Verification`
+block with: (a) command run, (b) pasted output, (c) proof the test
+fails when the feature is broken (second run with feature
+commented-out showing FAIL).
+
+**Cross-reference:** umbrella `CONSTITUTION.md` Article XI
+(§§ 11.1 — 11.8).
+
+<!-- END anti-bluff-testing addendum (Article XI) -->
