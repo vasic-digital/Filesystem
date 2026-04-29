@@ -266,7 +266,7 @@ func TestLocalClient_Symlink_ReadFile(t *testing.T) {
 	linkPath := filepath.Join(tempDir, "link.txt")
 	err := os.Symlink(realPath, linkPath)
 	if err != nil {
-		t.Skip("symlinks not supported on this filesystem")
+		t.Skip("symlinks not supported on this filesystem")  // SKIP-OK: #legacy-untriaged
 	}
 
 	// Reading via symlink should work
@@ -291,7 +291,7 @@ func TestLocalClient_Symlink_GetFileInfo(t *testing.T) {
 	linkPath := filepath.Join(tempDir, "symlink.txt")
 	err := os.Symlink(realPath, linkPath)
 	if err != nil {
-		t.Skip("symlinks not supported")
+		t.Skip("symlinks not supported")  // SKIP-OK: #legacy-untriaged
 	}
 
 	info, err := c.GetFileInfo(context.Background(), "symlink.txt")
