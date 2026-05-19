@@ -1,0 +1,24 @@
+# Round-246 bilingual fixture for Filesystem (Serbian Latin locale).
+# Exercises non-ASCII filenames and UTF-8 file bodies — proves the
+# Filesystem clients (local protocol exerciser) do not silently corrupt
+# names or content under multi-byte UTF-8 sequences. CONST-046 + Article
+# XI §11.9 alignment.
+locale: sr-Latn
+description: Latinic Serbian filenames + bodies; round-trip equality required.
+files:
+  - path: pozdrav.txt
+    content: |
+      Zdravo, svete!
+      Filesystem izazov broj 246.
+  - path: podaci/brojevi.csv
+    content: |
+      id,naziv,vrednost
+      1,alfa,10
+      2,beta,20
+      3,gama,30
+  - path: dnevnik/početak.log
+    content: |
+      Početni unos dnevnika sa dijakritičkim znakovima: čšđžć.
+directories:
+  - dnevnik
+  - podaci/arhiva

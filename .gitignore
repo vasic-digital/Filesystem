@@ -38,3 +38,21 @@ __debug_bin*
 .env
 .env.local
 .env.*.local
+
+# Round-246 challenge runtime artefacts (CONST-053)
+challenges/.last-run/
+challenges/runner/runner
+/fs_round246_runner
+
+# Build / dist (recreatable from source per CONST-053)
+/build/
+/out/
+
+# Logs (forensic only; never versioned per CONST-053)
+*.log
+
+# IDE / OS extras
+.history/
+Thumbs.db
+*.orig
+*.rej

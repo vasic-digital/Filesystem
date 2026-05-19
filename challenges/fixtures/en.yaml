@@ -1,0 +1,23 @@
+# Round-246 bilingual fixture for Filesystem (English locale).
+# Exercised by challenges/runner/main.go against a real local-protocol
+# client. Anti-bluff invariant (CONST-035 / Article XI §11.9):
+#   every file written through the client MUST be readable back
+#   byte-for-byte; size, name, content bytes are verified.
+locale: en
+description: ASCII filenames and file bodies exercised against local protocol.
+files:
+  - path: readme.txt
+    content: |
+      Hello, world!
+      Filesystem round-246 challenge.
+  - path: data/numbers.csv
+    content: |
+      id,name,value
+      1,alpha,10
+      2,beta,20
+      3,gamma,30
+  - path: empty.bin
+    content: ""
+directories:
+  - logs
+  - data/archive
