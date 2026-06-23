@@ -10,9 +10,5 @@ fully decoupled and project-agnostic per §11.4.28).
 
 Canonical reference: https://github.com/HelixDevelopment/HelixConstitution
 
-## Project Context
-This submodule is part of the parent project.
-See the [feature spec](https://github.com/HelixDevelopment/HelixPlay/blob/001-helixplay-system/specs/001-helixplay-system/spec.md).
-
 ## Submodule-Specific Notes
 <!-- Add submodule-specific AI agent guidance here -->
