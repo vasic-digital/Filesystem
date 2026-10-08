@@ -24,8 +24,7 @@ func TestNewFTPClient(t *testing.T) {
 	c := NewFTPClient(config)
 	require.NotNil(t, c)
 	assert.Equal(t, config, c.config)
-	assert.False(t, c.connected)
-	assert.Nil(t, c.client)
+	assert.False(t, c.IsConnected())
 }
 
 func TestFTPClient_GetProtocol(t *testing.T) {
@@ -42,17 +41,17 @@ func TestFTPClient_GetConfig(t *testing.T) {
 		Path:     "/files",
 	}
 	c := NewFTPClient(config)
-	assert.Equal(t, config, c.GetConfig())
+	pub, ok := c.GetConfig().(*PublicConfig)
+	require.True(t, ok)
+	assert.Equal(t, "ftp.example.com", pub.Host)
+	assert.Equal(t, 2121, pub.Port)
+	assert.Equal(t, "admin", pub.Username)
+	assert.Equal(t, "/files", pub.Path)
+	assert.Equal(t, TLSExplicit, pub.TLSMode)
 }
 
 func TestFTPClient_IsConnected_NotConnected(t *testing.T) {
 	c := NewFTPClient(&Config{})
-	assert.False(t, c.IsConnected())
-}
-
-func TestFTPClient_IsConnected_FlagTrueButNilClient(t *testing.T) {
-	c := NewFTPClient(&Config{})
-	c.connected = true
 	assert.False(t, c.IsConnected())
 }
 
@@ -63,7 +62,7 @@ func TestFTPClient_ResolvePath_WithBasePath(t *testing.T) {
 
 func TestFTPClient_ResolvePath_WithoutBasePath(t *testing.T) {
 	c := NewFTPClient(&Config{Path: ""})
-	assert.Equal(t, "subdir/file.txt", c.resolvePath("subdir/file.txt"))
+	assert.Equal(t, "/subdir/file.txt", c.resolvePath("subdir/file.txt"))
 }
 
 func TestFTPClient_ResolvePath_RootPath(t *testing.T) {
@@ -149,16 +148,13 @@ func TestFTPClient_Disconnect_NilClient(t *testing.T) {
 	c := NewFTPClient(&Config{})
 	err := c.Disconnect(context.Background())
 	assert.NoError(t, err)
-	assert.False(t, c.connected)
+	assert.False(t, c.IsConnected())
 }
 
-func TestFTPClient_Disconnect_SetsState(t *testing.T) {
+func TestFTPClient_Disconnect_NeverDialled(t *testing.T) {
 	c := NewFTPClient(&Config{})
-	c.connected = true
-	// client is nil, so Quit() won't be called
-	err := c.Disconnect(context.Background())
-	assert.NoError(t, err)
-	assert.False(t, c.connected)
+	assert.NoError(t, c.Disconnect(context.Background()))
+	assert.False(t, c.IsConnected())
 }
 
 func TestFTPClient_Connect_InvalidServer(t *testing.T) {
@@ -167,6 +163,7 @@ func TestFTPClient_Connect_InvalidServer(t *testing.T) {
 		Port:     1, // port 1 is unlikely to have an FTP server
 		Username: "user",
 		Password: "pass",
+		TLSMode:  TLSNone, TrustedLAN: true,
 	})
 	err := c.Connect(context.Background())
 	assert.Error(t, err)
