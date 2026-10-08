@@ -18,15 +18,17 @@
 //     check against symlink escapes that FAILS CLOSED (a RealPath error other than "does not exist" refuses the call).
 //     The check and the following open are two requests: a symlink swapped in between is a TOCTOU window this client
 //     cannot close.
-//   - Every call into pkg/sftp is bounded: a call whose context ends gets CancelGrace to finish on its own, then the
-//     ssh connection is closed (which ends the call) and the call returns the context error. Because one client holds
-//     one connection, that close also fails the other calls and streams that were using it; they see a lost connection
-//     and (for the request/response calls) are re-dialled once, single-flight. An SSH keepalive closes a connection
-//     whose peer stopped answering. Connect honours its context through the SSH handshake, the sftp subsystem start and
-//     the root check.
+//   - Every call into pkg/sftp is bounded: a call whose context ends gets CancelGrace to finish on its own; a call that
+//     returns by itself inside the grace (with the context error) leaves the connection alone, one that is really stuck
+//     has the ssh connection closed under it (which ends the call) and returns the context error. Because one client
+//     holds one connection, that close also fails the other calls and streams that were using it; they see a lost
+//     connection and (for the request/response calls) are re-dialled once, single-flight. An SSH keepalive closes a
+//     connection whose peer stopped answering; the same KeepAliveTimeout bounds the liveness question asked after an
+//     end of file. Connect honours its context through the SSH handshake, the sftp subsystem start and the root check.
 //   - Every reply frame is parsed completely before pkg/sftp reads it (frame.go): a malformed reply ends the
 //     connection and fails with ErrMalformedReply instead of panicking inside pkg/sftp (including its own worker
-//     goroutines, which no recover() here could reach).
+//     goroutines, which no recover() here could reach). The entry budget of a listing (MaxDirEntries) is counted per
+//     listing (per directory handle, from the requests this client sent) and fails only that listing.
 //   - Bounded retry with exponential backoff on TRANSIENT errors only (network timeouts, resets, a lost connection).
 //     A server status reply (including SSH_FX_EOF to a stat or open) is a reply, not a lost connection. Authentication
 //     failures, host key refusals, missing credentials, malformed replies, not found and permission denied are never
@@ -50,6 +52,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"digital.vasic.filesystem/pkg/client"
+	"digital.vasic.filesystem/pkg/fabric"
 )
 
 // ErrReadOnly is returned by every mutating operation.
@@ -60,6 +63,13 @@ var ErrPathEscape = errors.New("sftp: path escapes the configured root")
 
 // ErrNotConnected is returned when an operation needs a connection that does not exist.
 var ErrNotConnected = errors.New("sftp: not connected")
+
+// ErrDisconnected is returned by Connect when Disconnect ran while the connection was being established: the new connection is
+// closed instead of being installed after the caller asked for the client to be down.
+var ErrDisconnected = errors.New("sftp: disconnected while connecting")
+
+// ErrInvalidConfig is returned for a Config value that can never work (it is checked before any network traffic). Not retried.
+var ErrInvalidConfig = errors.New("sftp: invalid configuration")
 
 // AuthError reports that the server rejected the credentials. It is never retried.
 type AuthError struct {
@@ -72,6 +82,11 @@ func (e *AuthError) Error() string {
 	return fmt.Sprintf("sftp: authentication failed for user %q on %s: %v", e.User, e.Host, e.Err)
 }
 func (e *AuthError) Unwrap() error { return e.Err }
+
+// Is is the typed contract with pkg/fabric: a rejected login is fabric.ErrAuth, so fabric.Classify reports ClassAuth and the pool
+// never logs in again with the rejected secret (NAS auto-block protection). Nothing depends on the text of the underlying
+// x/crypto error, which differs between the plain password rejection and the keyboard-interactive shape.
+func (e *AuthError) Is(target error) bool { return target == fabric.ErrAuth }
 
 // serverStatus wraps an io.EOF that pkg/sftp produced from a STATUS reply (SSH_FX_EOF) of a request/response call.
 // It hides io.EOF from errors.Is: a reply is not a transport failure and must not be retried or tear the connection down.
@@ -94,6 +109,8 @@ const (
 	DefaultMaxDirEntries         = 1_000_000
 	maxRetryDelay                = 2 * time.Second
 	maxReadWindow                = 4 << 20
+	// MaxPacketLimit is the largest Config.MaxPacket pkg/sftp accepts; a larger value is ErrInvalidConfig.
+	MaxPacketLimit = 32768
 )
 
 // Config is the connection configuration. It contains NO secret: the secret is behind CredentialRef.
@@ -116,22 +133,24 @@ type Config struct {
 	RetryBase time.Duration
 	// MaxConcurrentRequests is the pipelining window per file; 0 selects DefaultMaxConcurrentRequests.
 	MaxConcurrentRequests int
-	// MaxPacket is the sftp packet size; 0 selects DefaultMaxPacket.
+	// MaxPacket is the sftp packet size; 0 selects DefaultMaxPacket. pkg/sftp refuses more than MaxPacketLimit (32768): a larger
+	// value fails every connect with ErrInvalidConfig.
 	MaxPacket int
 	// SkipSymlinkCheck turns off the RealPath containment check (one extra round trip per open and listing).
 	SkipSymlinkCheck bool
 	// KeepAliveInterval is the period of the SSH keepalive request; 0 selects DefaultKeepAliveInterval, negative disables it.
 	KeepAliveInterval time.Duration
 	// KeepAliveTimeout is how long a keepalive may stay unanswered before the connection is closed; 0 selects
-	// DefaultKeepAliveTimeout.
+	// DefaultKeepAliveTimeout. It is the ONE liveness bound of the client: the question "is the connection alive?" that the
+	// client asks after every end of file (one keepalive round trip per file end) uses the same value.
 	KeepAliveTimeout time.Duration
 	// CancelGrace is how long a call whose context ended may still finish on its own before the connection is closed to end
 	// it; 0 selects DefaultCancelGrace, negative closes at once.
 	CancelGrace time.Duration
 	// CloseTimeout bounds closing a file (the CLOSE request) on a stalled server; 0 selects DefaultCloseTimeout.
 	CloseTimeout time.Duration
-	// MaxDirEntries bounds the entries one listing may deliver (concurrent listings on one client share the budget);
-	// 0 selects DefaultMaxDirEntries, negative disables the limit. Exceeding it fails with ErrDirTooLarge.
+	// MaxDirEntries bounds the entries ONE listing may deliver (each listing has its own budget); 0 selects
+	// DefaultMaxDirEntries, negative disables the limit. Exceeding it fails that listing, and only it, with ErrDirTooLarge.
 	MaxDirEntries int
 }
 
@@ -157,12 +176,10 @@ type conn struct {
 	probe    func() bool // tests: replaces the keepalive round trip of alive(); nil in production
 
 	fmu   sync.Mutex
-	fault error // first protocol fault (malformed reply, oversize listing); the connection is closed with it
+	fault error // first protocol fault (malformed reply); the connection is closed with it
 
-	lmu        sync.Mutex
-	lists      int // listings in flight
-	seen       int // NAME entries received while listings were in flight
-	maxEntries int // 0 = unlimited
+	tr           *wireTracker  // per-listing entry accounting (frame.go); never nil
+	aliveTimeout time.Duration // the bound of alive(): Config.KeepAliveTimeout
 }
 
 func (cn *conn) isDead() bool {
@@ -174,12 +191,11 @@ func (cn *conn) isDead() bool {
 	}
 }
 
-// probeTimeout bounds alive() (a variable so that a test can shorten it).
-var probeTimeout = 3 * time.Second
-
 // alive reports whether the ssh connection still answers. It exists because pkg/sftp renders two different things as io.EOF: a
 // STATUS reply SSH_FX_EOF (the connection is fine) and the write error of a channel that is already closed (the connection is
-// gone). A keepalive round trip tells them apart: a dead transport fails it at once, a live server answers it.
+// gone). A keepalive round trip tells them apart: a dead transport fails it at once, a live server answers it. Cheaper evidence
+// comes first (the dead channel); the round trip is bounded by KeepAliveTimeout, the same bound the periodic keepalive uses, so a
+// slow link that the owner allowed 15 s (or more) to answer is not declared dead after 3 s.
 func (cn *conn) alive() bool {
 	if cn.probe != nil {
 		return cn.probe()
@@ -189,7 +205,11 @@ func (cn *conn) alive() bool {
 	}
 	res := make(chan error, 1)
 	go func() { _, _, err := cn.ssh.SendRequest("keepalive@openssh.com", true, nil); res <- err }()
-	t := time.NewTimer(probeTimeout)
+	to := cn.aliveTimeout
+	if to <= 0 {
+		to = DefaultKeepAliveTimeout
+	}
+	t := time.NewTimer(to)
 	defer t.Stop()
 	select {
 	case err := <-res:
@@ -228,35 +248,6 @@ func (cn *conn) faultErr() error {
 	return cn.fault
 }
 
-func (cn *conn) beginList() {
-	cn.lmu.Lock()
-	if cn.lists == 0 {
-		cn.seen = 0
-	}
-	cn.lists++
-	cn.lmu.Unlock()
-}
-
-func (cn *conn) endList() {
-	cn.lmu.Lock()
-	cn.lists--
-	cn.lmu.Unlock()
-}
-
-// countNames is called by the frame reader for every NAME reply.
-func (cn *conn) countNames(n int) error {
-	cn.lmu.Lock()
-	defer cn.lmu.Unlock()
-	if cn.lists == 0 {
-		return nil
-	}
-	cn.seen += n
-	if cn.maxEntries > 0 && cn.seen > cn.maxEntries {
-		return fmt.Errorf("%w: more than %d entries", ErrDirTooLarge, cn.maxEntries)
-	}
-	return nil
-}
-
 // protect runs fn and turns a panic of the calling goroutine into a protocol fault. The wire validator (frame.go) is the
 // boundary that covers pkg/sftp's own goroutines; this is the second layer for everything else.
 func protect(cn *conn, fn func() error) (err error) {
@@ -277,6 +268,7 @@ type Client struct {
 	cur    *conn
 	state  connState
 	flight *dialFlight
+	gen    uint64 // bumped by Disconnect: a Connect that started before it must not install its connection
 
 	backoffHook func(time.Duration) // tests: observes every backoff delay before it is waited; nil in production
 	listHook    func(*conn)         // tests: runs after a listing succeeded, before the connection is checked; nil in production
@@ -349,6 +341,36 @@ func (c *Client) closeTimeout() time.Duration {
 		return DefaultCloseTimeout
 	}
 	return c.cfg.CloseTimeout
+}
+
+// livenessTimeout is the ONE bound for "does the peer still answer?": the periodic keepalive and the question asked after an end of
+// file (conn.alive) both use it.
+func (c *Client) livenessTimeout() time.Duration {
+	if c.cfg.KeepAliveTimeout <= 0 {
+		return DefaultKeepAliveTimeout
+	}
+	return c.cfg.KeepAliveTimeout
+}
+
+// keepaliveInterval is the resolved period of the SSH keepalive; ok is false when the keepalive is disabled (negative interval).
+func (c *Client) keepaliveInterval() (iv time.Duration, ok bool) {
+	switch d := c.cfg.KeepAliveInterval; {
+	case d < 0:
+		return 0, false
+	case d == 0:
+		return DefaultKeepAliveInterval, true
+	default:
+		return d, true
+	}
+}
+
+// readWindow is the size of one ranged read: MaxPacket x MaxConcurrentRequests, capped at maxReadWindow (4 MiB).
+func (c *Client) readWindow() int {
+	w := orInt(c.cfg.MaxPacket, DefaultMaxPacket) * orInt(c.cfg.MaxConcurrentRequests, DefaultMaxConcurrentRequests)
+	if w > maxReadWindow {
+		w = maxReadWindow
+	}
+	return w
 }
 
 func (c *Client) maxDirEntries() int {
@@ -452,7 +474,7 @@ func (c *Client) openSFTP(sshc *ssh.Client, cn *conn) (*gosftp.Client, error) {
 		gosftp.MaxConcurrentRequestsPerFile(orInt(c.cfg.MaxConcurrentRequests, DefaultMaxConcurrentRequests)),
 		gosftp.UseConcurrentReads(true),
 	}
-	return gosftp.NewClientPipe(newFrameReader(pr, cn.countNames, cn.setFault), pw, opts...)
+	return gosftp.NewClientPipe(newFrameReader(pr, cn.tr, cn.setFault), &trackedWriter{WriteCloser: pw, tr: cn.tr}, opts...)
 }
 
 // dialConn establishes an ssh connection and its sftp session. It installs nothing: the caller decides who owns it.
@@ -463,6 +485,9 @@ func (c *Client) dialConn(ctx context.Context) (*conn, error) {
 	}
 	if strings.TrimSpace(c.cfg.Host) == "" || strings.TrimSpace(c.cfg.Username) == "" {
 		return nil, errors.New("sftp: host and username are required")
+	}
+	if c.cfg.MaxPacket > MaxPacketLimit {
+		return nil, fmt.Errorf("%w: MaxPacket %d exceeds the %d bytes pkg/sftp accepts", ErrInvalidConfig, c.cfg.MaxPacket, MaxPacketLimit)
 	}
 	hp := c.hostport()
 	pins, err := c.cfg.PinStore.Lookup(hp)
@@ -514,7 +539,8 @@ func (c *Client) dialConn(ctx context.Context) (*conn, error) {
 		return nil, fmt.Errorf("sftp: ssh handshake with %s: %w", hp, err)
 	}
 	sshc := ssh.NewClient(sconn, chans, reqs)
-	cn := &conn{ssh: sshc, done: make(chan struct{}), dead: make(chan struct{}), rootReal: "/", maxEntries: c.maxDirEntries()}
+	cn := &conn{ssh: sshc, done: make(chan struct{}), dead: make(chan struct{}), rootReal: "/",
+		tr: newWireTracker(c.maxDirEntries()), aliveTimeout: c.livenessTimeout()}
 	go func() { _ = sshc.Wait(); close(cn.dead) }()
 	fail := func(err error) (*conn, error) {
 		stop()
@@ -571,17 +597,11 @@ func orInt(v, d int) int {
 // keepalive closes cn when the peer stops answering SSH keepalive requests (a half-open TCP connection is otherwise only
 // noticed after the kernel gives up). It ends with the connection.
 func (c *Client) keepalive(cn *conn) {
-	iv := c.cfg.KeepAliveInterval
-	if iv < 0 {
+	iv, ok := c.keepaliveInterval()
+	if !ok {
 		return
 	}
-	if iv == 0 {
-		iv = DefaultKeepAliveInterval
-	}
-	to := c.cfg.KeepAliveTimeout
-	if to <= 0 {
-		to = DefaultKeepAliveTimeout
-	}
+	to := c.livenessTimeout()
 	go func() {
 		t := time.NewTicker(iv)
 		defer t.Stop()
@@ -627,12 +647,21 @@ func (c *Client) drop(cn *conn) {
 
 // Connect establishes the connection, retrying transient failures a bounded number of times.
 func (c *Client) Connect(ctx context.Context) error {
+	c.mu.Lock()
+	gen := c.gen
+	c.mu.Unlock()
 	err := c.retry(ctx, func() error {
 		cn, err := c.dialConn(ctx)
 		if err != nil {
 			return err
 		}
 		c.mu.Lock()
+		if c.gen != gen {
+			// Disconnect returned while this connection was being established: the caller asked for the client to be down
+			c.mu.Unlock()
+			cn.close()
+			return ErrDisconnected
+		}
 		old := c.cur
 		c.cur, c.state = cn, stateUp
 		c.mu.Unlock()
@@ -652,12 +681,13 @@ func (c *Client) Connect(ctx context.Context) error {
 }
 
 // Disconnect closes the connection. The client does not reconnect implicitly afterwards, not even a re-dial that was
-// already in flight.
+// already in flight, and a Connect that is still establishing its connection fails with ErrDisconnected instead of installing it.
 func (c *Client) Disconnect(_ context.Context) error {
 	c.mu.Lock()
 	cn := c.cur
 	c.cur = nil
 	c.state = stateDown
+	c.gen++
 	c.mu.Unlock()
 	if cn != nil {
 		cn.close()
@@ -766,6 +796,10 @@ func IsTransient(err error) bool {
 // ErrSSHFxConnectionLost / ErrSSHFxNoConnection, or - for the write error of an already closed channel - also as io.EOF; run and
 // file tell that case from a reply by asking the connection, see conn.alive.)
 func isConnectionLoss(err error) bool {
+	if isCtxErr(err) {
+		// context.DeadlineExceeded is a net.Error with Timeout()==true, but it says "the caller gave up", not "the transport broke"
+		return false
+	}
 	if errors.Is(err, gosftp.ErrSSHFxConnectionLost) || errors.Is(err, gosftp.ErrSSHFxNoConnection) ||
 		errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) ||
 		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.EPIPE) || errors.Is(err, os.ErrDeadlineExceeded) {
@@ -873,6 +907,38 @@ func (c *Client) guard(ctx context.Context, cn *conn) func() {
 	}
 }
 
+// disposition is what to do with the connection and the error after a call into pkg/sftp returned an error (and no protocol fault
+// was recorded). It is a pure function of (ctx error, call error) so that the whole table of errors that can reach it is testable.
+type disposition int
+
+const (
+	dispReturn  disposition = iota // return the error unchanged, keep the connection
+	dispCtxOnly                    // the call gave up by itself on the context: return the context error, keep the connection
+	dispDropCtx                    // the connection broke under a call whose context ended: drop it, return the context error
+	dispDropErr                    // a transport failure: drop the connection, return the error
+	dispProbe                      // io.EOF: a server reply or a dead channel; ask the connection
+)
+
+func callDisposition(ctxErr, err error) disposition {
+	if ctxErr != nil {
+		if isCtxErr(err) {
+			// pkg/sftp's ctx-aware calls return ctx.Err() themselves and handle the abandoned request safely (a late reply goes
+			// to a buffered channel). Nothing is wrong with the connection; the guard already drops one that is really stuck.
+			return dispCtxOnly
+		}
+		if isConnectionLoss(err) {
+			return dispDropCtx
+		}
+	}
+	switch {
+	case isConnectionLoss(err):
+		return dispDropErr
+	case errors.Is(err, io.EOF):
+		return dispProbe
+	}
+	return dispReturn
+}
+
 // run executes one blocking request/response call on cn under the cancellation guard and the panic boundary and
 // classifies its error.
 func (c *Client) run(ctx context.Context, cn *conn, fn func() error) error {
@@ -886,15 +952,16 @@ func (c *Client) run(ctx context.Context, cn *conn, fn func() error) error {
 		c.drop(cn)
 		return f
 	}
-	if cerr := ctx.Err(); cerr != nil && (isConnectionLoss(err) || isCtxErr(err)) {
+	switch callDisposition(ctx.Err(), err) {
+	case dispCtxOnly:
+		return ctx.Err()
+	case dispDropCtx:
 		c.drop(cn)
-		return cerr
-	}
-	if isConnectionLoss(err) {
+		return ctx.Err()
+	case dispDropErr:
 		c.drop(cn)
 		return err
-	}
-	if errors.Is(err, io.EOF) {
+	case dispProbe:
 		// pkg/sftp renders a STATUS reply SSH_FX_EOF and the write error of a closed channel both as io.EOF
 		if cn.alive() {
 			return &serverStatus{err: err}
@@ -1005,6 +1072,14 @@ func (cw ctxWriter) Write(p []byte) (int, error) {
 
 // file wraps an open remote file. Every call into pkg/sftp runs under the cancellation guard and the panic boundary;
 // WriteTo keeps the pipelined read path of pkg/sftp. A file whose context ends is closed (bounded by CloseTimeout).
+//
+// Read adds a sequential READ-AHEAD: after two plain reads without a Seek, a Read whose buffer is smaller than the read window
+// fetches the next block (starting at one pkg/sftp packet pair, doubling up to the read window, which pkg/sftp serves with its
+// pipelined concurrent requests) into a buffer and serves the following Reads from it. That is what makes the consumer's real
+// streaming path (http.ServeContent over OpenSeekable, which copies in 32 KiB reads) pipelined too. The cost, stated: an open file
+// that is read sequentially holds up to one read window (default 2 MiB, at most 4 MiB) of buffer and the server is asked for up to
+// that much beyond the byte the consumer stopped at. Read, Seek and WriteTo are not safe for concurrent use (like any io.Reader);
+// Close may run at any time.
 type file struct {
 	c    *Client
 	cn   *conn
@@ -1013,7 +1088,18 @@ type file struct {
 	smu  sync.Mutex // guards stop: the AfterFunc below may run (and call Close) before newFile has stored it
 	stop func() bool
 	once sync.Once
+
+	pos     int64  // offset of the next byte Read delivers (the sftp file itself is len(ra) bytes ahead of it)
+	ra      []byte // read-ahead bytes not delivered yet, starting at pos
+	raBuf   []byte
+	seq     int   // Reads since open or the last Seek
+	raNext  int   // size of the next read-ahead fill (0 until the read-ahead started)
+	pending error // io.EOF (liveness verified) or the error that ended the last fill; delivered once ra is drained
+	noRA    bool  // a bounded range: never read ahead (it would fetch bytes beyond the range)
 }
+
+// raAfter is the number of plain sequential Reads after which the read-ahead starts.
+const raAfter = 2
 
 func (c *Client) newFile(ctx context.Context, cn *conn, f *gosftp.File) *file {
 	fl := &file{c: c, cn: cn, ctx: ctx, f: f}
@@ -1040,21 +1126,90 @@ func (fl *file) call(fn func() error) error {
 	}
 	if isConnectionLoss(err) {
 		fl.c.drop(fl.cn)
+		return err
+	}
+	if errors.Is(err, io.EOF) && !fl.cn.alive() {
+		// the send error of an already closed channel: pkg/sftp wraps io.EOF with %w. The handle died with its connection.
+		fl.c.drop(fl.cn)
+		return fmt.Errorf("%w: %v", gosftp.ErrSSHFxConnectionLost, err)
 	}
 	return err
 }
 
-func (fl *file) Read(p []byte) (n int, err error) {
-	if err := fl.ctx.Err(); err != nil {
-		return 0, err
-	}
+// readDirect is one Read straight on the sftp file. An io.EOF is verified against the connection: the write error of a dead
+// channel is io.EOF too, and a truncated file must not look complete.
+func (fl *file) readDirect(p []byte) (n int, err error) {
 	err = fl.call(func() (e error) { n, e = fl.f.Read(p); return e })
 	if err == io.EOF && !fl.cn.alive() {
-		// an EOF from a dead connection is a truncated file, not the end of it
 		fl.c.drop(fl.cn)
 		return n, fmt.Errorf("%w: %v", gosftp.ErrSSHFxConnectionLost, err)
 	}
 	return n, err
+}
+
+func (fl *file) Read(p []byte) (int, error) {
+	if err := fl.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	if len(fl.ra) > 0 {
+		n := copy(p, fl.ra)
+		fl.ra = fl.ra[n:]
+		fl.pos += int64(n)
+		fl.seq++
+		return n, nil
+	}
+	if fl.pending != nil {
+		err := fl.pending
+		if err != io.EOF {
+			fl.pending = nil // only the end of the file is sticky
+		}
+		return 0, err
+	}
+	win := fl.c.readWindow()
+	if !fl.noRA && fl.seq >= raAfter && len(p) < win {
+		if fl.raNext == 0 {
+			fl.raNext = 2 * orInt(fl.c.cfg.MaxPacket, DefaultMaxPacket)
+		} else if fl.raNext < win {
+			fl.raNext *= 2
+		}
+		size := fl.raNext
+		if size > win {
+			size = win
+		}
+		if size > len(p) {
+			return fl.fill(p, size)
+		}
+	}
+	n, err := fl.readDirect(p)
+	fl.pos += int64(n)
+	if n > 0 {
+		fl.seq++
+	}
+	return n, err
+}
+
+// fill reads size bytes ahead into the buffer and serves p from it.
+func (fl *file) fill(p []byte, size int) (int, error) {
+	if cap(fl.raBuf) < size {
+		fl.raBuf = make([]byte, size)
+	}
+	buf := fl.raBuf[:size]
+	n, err := fl.readDirect(buf)
+	fl.ra = buf[:n]
+	if n == 0 {
+		return 0, err
+	}
+	if err != nil {
+		fl.pending = err // delivered after the bytes
+	}
+	m := copy(p, fl.ra)
+	fl.ra = fl.ra[m:]
+	fl.pos += int64(m)
+	fl.seq++
+	return m, nil
 }
 
 // WriteTo is the pipelined path: pkg/sftp keeps a window of concurrent read requests in flight.
@@ -1062,7 +1217,29 @@ func (fl *file) WriteTo(w io.Writer) (n int64, err error) {
 	if err := fl.ctx.Err(); err != nil {
 		return 0, err
 	}
-	err = fl.call(func() (e error) { n, e = fl.f.WriteTo(ctxWriter{ctx: fl.ctx, w: w}); return e })
+	if len(fl.ra) > 0 {
+		m, werr := ctxWriter{ctx: fl.ctx, w: w}.Write(fl.ra)
+		n += int64(m)
+		fl.pos += int64(m)
+		fl.ra = fl.ra[m:]
+		if werr == nil && len(fl.ra) > 0 {
+			werr = io.ErrShortWrite
+		}
+		if werr != nil {
+			return n, werr
+		}
+	}
+	if pe := fl.pending; pe != nil {
+		if pe == io.EOF {
+			return n, nil // the end of the file, already verified against the connection
+		}
+		fl.pending = nil
+		return n, pe
+	}
+	var m int64
+	err = fl.call(func() (e error) { m, e = fl.f.WriteTo(ctxWriter{ctx: fl.ctx, w: w}); return e })
+	n += m
+	fl.pos += m
 	if (err == nil || err == io.EOF) && !fl.cn.alive() {
 		// pkg/sftp maps a closed channel (io.EOF) to a clean end of file: a copy that ended on a dead connection is truncated
 		fl.c.drop(fl.cn)
@@ -1075,8 +1252,32 @@ func (fl *file) Seek(off int64, whence int) (pos int64, err error) {
 	if err := fl.ctx.Err(); err != nil {
 		return 0, err
 	}
+	if whence == io.SeekStart || whence == io.SeekCurrent {
+		abs := off
+		if whence == io.SeekCurrent {
+			abs = fl.pos + off
+		}
+		if abs >= fl.pos && abs-fl.pos <= int64(len(fl.ra)) {
+			// inside what is already buffered (also: no move at all): no request needed
+			fl.ra = fl.ra[abs-fl.pos:]
+			fl.pos = abs
+			return abs, nil
+		}
+		off, whence = abs, io.SeekStart // the sftp file is ahead of fl.pos by the buffered bytes: SeekCurrent would be wrong
+	}
 	err = fl.call(func() (e error) { pos, e = fl.f.Seek(off, whence); return e })
-	return pos, err
+	if err != nil {
+		return pos, err
+	}
+	fl.ra, fl.pending, fl.seq, fl.raNext = nil, nil, 0, 0
+	fl.pos = pos
+	return pos, nil
+}
+
+// deadHandle reports whether a Close error only says that the handle died with its connection.
+func (fl *file) deadHandle(err error) bool {
+	return errors.Is(err, os.ErrClosed) || errors.Is(err, gosftp.ErrSSHFxConnectionLost) || errors.Is(err, gosftp.ErrSSHFxNoConnection) ||
+		fl.cn.isDead() || (errors.Is(err, io.EOF) && !fl.cn.alive())
 }
 
 // Close closes the remote file. On a stalled server the CLOSE request cannot hang the caller: after CloseTimeout the
@@ -1091,7 +1292,7 @@ func (fl *file) Close() error {
 		t := time.AfterFunc(fl.c.closeTimeout(), func() { fl.c.drop(fl.cn) })
 		err = protect(fl.cn, fl.f.Close)
 		t.Stop()
-		if errors.Is(err, os.ErrClosed) || errors.Is(err, gosftp.ErrSSHFxConnectionLost) || errors.Is(err, gosftp.ErrSSHFxNoConnection) {
+		if err != nil && fl.deadHandle(err) {
 			err = nil // the handle died with its connection
 		}
 	})
@@ -1214,11 +1415,8 @@ func (c *Client) ReadRange(ctx context.Context, p string, offset, length int64) 
 	if length < 0 {
 		return f, nil
 	}
-	window := orInt(c.cfg.MaxPacket, DefaultMaxPacket) * orInt(c.cfg.MaxConcurrentRequests, DefaultMaxConcurrentRequests)
-	if window > maxReadWindow {
-		window = maxReadWindow
-	}
-	return &ranged{fl: f, remain: length, window: window}, nil
+	f.noRA = true
+	return &ranged{fl: f, remain: length, window: c.readWindow()}, nil
 }
 
 func toInfo(logical string, fi os.FileInfo) *client.FileInfo {
@@ -1278,6 +1476,13 @@ func (c *Client) FileExists(ctx context.Context, p string) (bool, error) {
 	return false, err
 }
 
+// plausibleName filters what a server may list as an entry: pkg/sftp reduces names with path.Base, which leaves "/" (an entry that would
+// point at its own directory); a name containing "/" or a NUL byte, and an empty name, is never a file name. "." and ".." are the directory
+// itself and its parent.
+func plausibleName(n string) bool {
+	return n != "" && n != "." && n != ".." && !strings.ContainsRune(n, 0) && !strings.Contains(n, "/")
+}
+
 // ListDirectory lists a directory with the attributes the server returned for each entry (no extra stat per
 // entry). Symbolic links are reported as links (Mode has os.ModeSymlink) and are not followed. A listing that delivers
 // more than Config.MaxDirEntries entries fails with ErrDirTooLarge.
@@ -1291,10 +1496,12 @@ func (c *Client) ListDirectory(ctx context.Context, p string) ([]*client.FileInf
 		if err := c.checkWithin(sc, cn, remote); err != nil {
 			return err
 		}
-		cn.beginList()
-		defer cn.endList()
 		entries, err := sc.ReadDirContext(ctx, remote)
 		if err != nil {
+			if cn.tr.isLimitError(err) {
+				// only this listing fails: the connection and everything else on it stay up
+				return fmt.Errorf("%w: more than %d entries", ErrDirTooLarge, cn.tr.max)
+			}
 			return err
 		}
 		if c.listHook != nil {
@@ -1305,7 +1512,7 @@ func (c *Client) ListDirectory(ctx context.Context, p string) ([]*client.FileInf
 		}
 		out = make([]*client.FileInfo, 0, len(entries))
 		for _, e := range entries {
-			if e.Name() == "." || e.Name() == ".." {
+			if !plausibleName(e.Name()) {
 				continue
 			}
 			out = append(out, toInfo(path.Join(logical, e.Name()), e))

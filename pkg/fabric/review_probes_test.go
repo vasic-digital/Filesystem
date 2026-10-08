@@ -448,7 +448,7 @@ func TestRV14_LeakedStreamsStarveSharedHost(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("without a lease the leaked streams must still hold the host: %v", err)
 	}
-	if st := b1.Stats(); st.Held != 2 || st.OldestHeld < 0 {
+	if st := b1.Stats(); st.Held != 2 || st.OldestHeld <= 0 { // round 3 (T4): `< 0` could never be true; a leaked stream has a positive age
 		t.Errorf("the leak is not visible in Stats: %+v", st)
 	}
 }

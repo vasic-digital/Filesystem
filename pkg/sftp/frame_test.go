@@ -100,12 +100,11 @@ func TestFrameReader_PassesValidFramesUnchangedEvenByteByByte(t *testing.T) {
 		"byte by byte": iotest.OneByteReader(bytes.NewReader(stream)),
 		"half reads":   iotest.HalfReader(bytes.NewReader(stream)),
 	} {
-		var names, faults int
-		fr := newFrameReader(rd, func(n int) error { names += n; return nil }, func(error) { faults++ })
+		var faults int
+		fr := newFrameReader(rd, newWireTracker(100), func(error) { faults++ })
 		got, err := io.ReadAll(fr)
 		require.NoError(t, err, name)
 		assert.Equal(t, stream, got, name)
-		assert.Equal(t, 1, names, name)
 		assert.Zero(t, faults, name)
 	}
 }
@@ -153,28 +152,96 @@ func TestFrameReader_LengthAndEOFHandling(t *testing.T) {
 	}
 }
 
-func TestFrameReader_ListingLimitIsReportedAsFault(t *testing.T) {
-	stream := cat(wireFrame(fxpName, u32b(1), u32b(2), strb("a"), strb(""), attrsB(0), strb("b"), strb(""), attrsB(0)))
-	limit := errors.New("limit")
-	var fault error
-	fr := newFrameReader(bytes.NewReader(stream), func(n int) error { return limit }, func(err error) { fault = err })
-	_, err := fr.Read(make([]byte, 8))
-	assert.ErrorIs(t, err, limit)
-	assert.ErrorIs(t, fault, limit)
+// An over-budget listing page is replaced by a STATUS failure of THAT listing (fix-r3, review S03): no fault, the connection's frames
+// keep flowing, and the replacement is itself a frame pkg/sftp can parse.
+func TestFrameReader_OverBudgetPageBecomesAStatusFailureNotAFault(t *testing.T) {
+	tr := newWireTracker(3)
+	tr.observe(wireFrame(fxpReaddir, u32b(7), strb("H1")))
+	two := func(id uint32) []byte {
+		return wireFrame(fxpName, u32b(id), u32b(2), strb("a"), strb(""), attrsB(0), strb("b"), strb(""), attrsB(0))
+	}
+	tail := wireFrame(fxpHandle, u32b(9), strb("h"))
+	var faults []error
+	fr := newFrameReader(bytes.NewReader(cat(two(7), tail)), tr, func(err error) { faults = append(faults, err) })
+	// page 1 (2 entries, budget 3): passes through unchanged
+	buf := make([]byte, len(two(7)))
+	_, err := io.ReadFull(fr, buf)
+	require.NoError(t, err)
+	assert.Equal(t, two(7), buf)
+	// page 2 for the same handle (2 more, 4 > 3): replaced
+	tr.observe(wireFrame(fxpReaddir, u32b(8), strb("H1")))
+	fr = newFrameReader(bytes.NewReader(cat(two(8), tail)), tr, func(err error) { faults = append(faults, err) })
+	got, err := io.ReadAll(fr)
+	require.NoError(t, err)
+	assert.Empty(t, faults, "a listing over its budget is not a connection fault")
+	repl := tr.limitStatus(8)
+	require.True(t, bytes.HasPrefix(got, repl), "the NAME frame is replaced by the failure status")
+	assert.Equal(t, tail, got[len(repl):], "the frames after it are untouched")
+	_, verr := validateFrame(repl[4], repl[5:])
+	assert.NoError(t, verr, "the replacement is a well-formed STATUS frame")
+	assert.Equal(t, byte(fxpStatus), repl[4])
+	assert.Contains(t, string(repl), tr.marker)
+	assert.True(t, tr.isLimitError(errors.New("sftp: \""+tr.marker+"\" (SSH_FX_FAILURE)")))
+	assert.False(t, tr.isLimitError(errors.New("sftp: \"some other server message\" (SSH_FX_FAILURE)")), "a server cannot forge the marker without knowing it")
 }
 
-func TestConn_ListingBudget(t *testing.T) {
-	cn := &conn{maxEntries: 10}
-	assert.NoError(t, cn.countNames(1000), "outside a listing nothing is counted (REALPATH replies are NAME frames too)")
-	cn.beginList()
-	assert.NoError(t, cn.countNames(6))
-	err := cn.countNames(6)
-	assert.ErrorIs(t, err, ErrDirTooLarge)
-	cn.endList()
-	cn.beginList() // a new listing starts a new budget
-	assert.NoError(t, cn.countNames(10))
-	cn.endList()
-	unlimited := &conn{}
-	unlimited.beginList()
-	assert.NoError(t, unlimited.countNames(1<<30))
+// The tracker's budget is per directory handle; REALPATH replies and other handles are not counted; CLOSE ends a handle's budget.
+func TestWireTracker_BudgetIsPerHandle(t *testing.T) {
+	tr := newWireTracker(10)
+	rd := func(id uint32, h string) []byte { return wireFrame(fxpReaddir, u32b(id), strb(h)) }
+	tr.observe(rd(1, "A"))
+	tr.observe(rd(2, "B"))
+	assert.False(t, tr.name(1, 6), "A: 6 of 10")
+	assert.False(t, tr.name(2, 6), "B: 6 of 10 - a different handle has its own budget")
+	tr.observe(rd(3, "A"))
+	assert.True(t, tr.name(3, 6), "A: 12 > 10")
+	tr.observe(rd(4, "A"))
+	assert.True(t, tr.name(4, 0), "A stays over budget until it is closed")
+	assert.False(t, tr.name(99, 1000), "a NAME reply to a request that is not a READDIR (REALPATH) is not counted")
+	tr.observe(wireFrame(fxpClose, u32b(5), strb("A")))
+	tr.observe(rd(6, "A")) // the same handle string reused by the server after the close: a new listing
+	assert.False(t, tr.name(6, 10))
+	// ids are forgotten at the reply: a STATUS reply (EOF) removes the READDIR entry
+	tr.observe(rd(7, "C"))
+	tr.replied(7)
+	assert.False(t, tr.name(7, 1000))
+	// unlimited
+	un := newWireTracker(0)
+	un.observe(rd(1, "A"))
+	assert.False(t, un.name(1, 1<<30))
+}
+
+// Frames are written as header and payload in separate Writes, and may be split anywhere: the stream parser must not care.
+func TestWireTracker_StreamParserSurvivesAnySplit(t *testing.T) {
+	stream := cat(
+		wireFrame(fxpOpendir, u32b(1), strb("/d")),     // not tracked: skipped
+		wireFrame(fxpReaddir, u32b(2), strb("HANDLE")), // tracked
+		wireFrame(fxpRead, u32b(3), strb("H"), u32b(0), u32b(0), u32b(32768)),
+		wireFrame(fxpClose, u32b(4), strb("OTHER")),
+		wireFrame(fxpReaddir, u32b(5), strb("H2")),
+	)
+	for _, chunk := range []int{1, 2, 3, 5, 7, 13, len(stream)} {
+		tr := newWireTracker(5)
+		for off := 0; off < len(stream); off += chunk {
+			end := off + chunk
+			if end > len(stream) {
+				end = len(stream)
+			}
+			tr.observe(stream[off:end])
+		}
+		assert.False(t, tr.name(2, 5), "chunk %d: HANDLE has 5 of 5", chunk)
+		assert.False(t, tr.name(5, 5), "chunk %d: H2 has its own budget", chunk)
+		assert.Empty(t, tr.cur, "chunk %d: nothing left half parsed", chunk)
+		assert.Zero(t, tr.skip, "chunk %d", chunk)
+	}
+	// garbage lengths never panic and never wedge the parser into tracking nonsense
+	tr := newWireTracker(1)
+	tr.observe(cat(u32b(0), u32b(0xffffffff), []byte{12, 1, 2, 3}))
+	assert.NotPanics(t, func() { tr.observe(bytes.Repeat([]byte{0xff}, 100)) })
+}
+
+func TestConn_ListingBudgetAccessorsFollowTheConfig(t *testing.T) {
+	assert.Equal(t, DefaultMaxDirEntries, NewSFTPClient(&Config{}).maxDirEntries())
+	assert.Equal(t, 0, NewSFTPClient(&Config{MaxDirEntries: -1}).maxDirEntries(), "negative disables the limit")
+	assert.Equal(t, 7, NewSFTPClient(&Config{MaxDirEntries: 7}).maxDirEntries())
 }

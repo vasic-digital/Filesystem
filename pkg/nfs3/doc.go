@@ -14,7 +14,7 @@
 // entry point in this package. The methods of client.Client that would mutate
 // (WriteFile, DeleteFile, CopyFile, CreateDirectory, DeleteDirectory) return
 // ErrReadOnly without sending anything. Three independent guards enforce this:
-// a run-time allow-list of (program, procedure) pairs at the single place where a request
+// a run-time allow-list of (program, version, procedure) triples at the single place where a request
 // is written (rpcConn.call refuses anything else with ErrReadOnly before a byte is sent),
 // TestNoWriteProcedureCompiledIn and the call-site allow-list test (which parse the source),
 // and the server-side procedure counters of the tests.

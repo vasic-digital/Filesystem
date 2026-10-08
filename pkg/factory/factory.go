@@ -69,15 +69,39 @@ func (f *DefaultFactory) SupportedProtocols() []string {
 	return []string{"smb", "ftp", "nfs", "webdav", "local", "sftp"}
 }
 
+// sftpSettingKeys are the only settings the sftp protocol reads. Every other key is refused: a setting the factory does not read would
+// sit in the stored configuration and be silently ignored (for a secret-like name, with a secret in it).
+var sftpSettingKeys = map[string]bool{"host": true, "port": true, "username": true, "credential_ref": true, "path": true, "root": true}
+
+// secretLike reports whether a settings key looks like it carries a secret: lower-cased with "-", "_", "." and spaces removed, it
+// contains one of the usual fragments ("Password", "PASSWD", "pwd", "private-key", "ssh_key", "credentials", "api_token" ...).
+func secretLike(k string) bool {
+	n := strings.ToLower(k)
+	for _, r := range []string{"-", "_", ".", " "} {
+		n = strings.ReplaceAll(n, r, "")
+	}
+	for _, frag := range []string{"pass", "pwd", "secret", "token", "key", "cred", "auth"} {
+		if strings.Contains(n, frag) {
+			return true
+		}
+	}
+	return false
+}
+
 // createSFTPClient builds the read-only SFTP client. It accepts NO inline password: the secret is behind
 // "credential_ref" (resolved by sftp.DefaultCredentialResolver at connect time). The host key pins come from the
-// package-level sftp.DefaultPinStore, which the application must set before it connects.
+// package-level sftp.DefaultPinStore, which the application must set before the client CONNECTS (it is followed at connect
+// time, not captured when the client is created).
 func (f *DefaultFactory) createSFTPClient(config *client.StorageConfig) (client.Client, error) {
-	// No secret is accepted inline, under any of its usual names: it would sit in the stored settings and be ignored.
-	for _, k := range []string{"password", "passphrase", "private_key", "privatekey", "key", "secret", "token"} {
-		if _, ok := config.Settings[k]; ok {
+	// Only the settings the client reads are accepted. A secret under any spelling is refused with its own message.
+	for k := range config.Settings {
+		if sftpSettingKeys[k] {
+			continue
+		}
+		if secretLike(k) {
 			return nil, fmt.Errorf("sftp: inline %q is not accepted, use credential_ref", k)
 		}
+		return nil, fmt.Errorf("sftp: unknown setting %q (accepted: host, port, username, credential_ref, path, root)", k)
 	}
 	port := 22
 	if v, ok := config.Settings["port"]; ok {
@@ -104,7 +128,7 @@ func (f *DefaultFactory) createSFTPClient(config *client.StorageConfig) (client.
 		Username:      GetStringSetting(config.Settings, "username", ""),
 		CredentialRef: GetStringSetting(config.Settings, "credential_ref", ""),
 		Root:          root,
-		PinStore:      sftppkg.DefaultPinStore,
+		PinStore:      sftppkg.DefaultPinStoreRef(),
 	}
 	return sftppkg.NewSFTPClient(c), nil
 }

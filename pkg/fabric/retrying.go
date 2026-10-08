@@ -15,6 +15,14 @@ import (
 // wants more is a mistake, not a configuration.
 const MaxRetryAttempts = 100
 
+// MinRetryDelay is the smallest wait between two attempts of a retried
+// operation. A computed delay below it - a tiny BaseDelay or MaxDelay, or a
+// Jitter function that returns 0 - is raised to it, so that no policy can turn
+// Retrying into a back-to-back retry storm against a host that is already
+// failing (MaxAttempts is bounded by MaxRetryAttempts, so the total is bounded
+// too). The delay actually used is also what the Clock is asked to sleep.
+const MinRetryDelay = 10 * time.Millisecond
+
 // RetryPolicy configures Retrying.
 type RetryPolicy struct {
 	// MaxAttempts is the total number of attempts including the first
@@ -22,9 +30,11 @@ type RetryPolicy struct {
 	MaxAttempts int
 	// BaseDelay is the wait before the second attempt; it doubles per attempt.
 	// It must be > 0 when MaxAttempts > 1: a zero delay is a back-to-back
-	// retry storm against a host that is already failing.
+	// retry storm against a host that is already failing. Whatever the value,
+	// the delay used is never below MinRetryDelay.
 	BaseDelay time.Duration
-	// MaxDelay caps the backoff (0 = no cap).
+	// MaxDelay caps the backoff (0 = no cap); the delay used is still never
+	// below MinRetryDelay.
 	MaxDelay time.Duration
 	// Classify decides whether a failure is retried. nil means Classify (the
 	// package default). Only ClassTransient is ever retried.
@@ -69,6 +79,9 @@ func (p RetryPolicy) delay(attempt int) time.Duration {
 	}
 	if p.Jitter != nil {
 		d = p.Jitter(d)
+	}
+	if d < MinRetryDelay {
+		d = MinRetryDelay // the floor applies after cap and jitter: neither can reach a storm
 	}
 	return d
 }

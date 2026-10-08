@@ -103,6 +103,12 @@ func (l *layer) ReadFile(ctx context.Context, path string) (io.ReadCloser, error
 			rc = nil
 			return e
 		}
+		if guard.IsNil(r) {
+			// (nil, nil) is a protocol client bug; a wrapper around it would panic
+			// on Close, and the around-function (Limited) would never release.
+			rc = nil
+			return ErrNilStream
+		}
 		rc = r
 		return nil
 	})
@@ -207,6 +213,10 @@ func (l *layerSeekable) OpenSeekable(ctx context.Context, path string) (client.R
 			}
 			rc = nil
 			return e
+		}
+		if guard.IsNil(r) {
+			rc = nil
+			return ErrNilStream
 		}
 		rc = r
 		return nil

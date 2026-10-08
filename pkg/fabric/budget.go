@@ -12,9 +12,17 @@ import (
 // BudgetConfig bounds the load one host sees from this process, across ALL
 // protocols used against it. Both limits are required and positive: there is
 // no silent default, a zero value is rejected by NewHostBudget.
+//
+// What the bound covers: every operation taken through Limited, including the
+// connection probe (TestConnection, taken without waiting: a busy budget skips
+// the probe, see TryAcquire). What it does not cover: Disconnect (closing a
+// connection must always be possible and is a local close plus at most a
+// logoff), the local calls IsConnected / GetProtocol / GetConfig, and, with
+// WithStreamLease, a stream that has been idle past its lease (its slot is
+// taken back; the leaked stream is the case the lease exists for).
 type BudgetConfig struct {
 	// MaxConcurrent is the maximum number of operations (and open read
-	// streams) in flight at once.
+	// streams) in flight at once, within the coverage described above.
 	MaxConcurrent int
 	// MaxReqPerSec is the maximum rate at which operations may START.
 	// Starts are spaced evenly (no burst): 10 req/s means 100 ms apart.
@@ -28,6 +36,12 @@ func NASBudget() BudgetConfig { return BudgetConfig{MaxConcurrent: 4, MaxReqPerS
 
 // ErrBudgetConfig is returned for an invalid BudgetConfig.
 var ErrBudgetConfig = errors.New("fabric: invalid host budget")
+
+// ErrBudgetBusy is wrapped (together with context.DeadlineExceeded) by the
+// error Acquire returns when the caller's deadline falls before its start slot,
+// so a caller can tell "the host budget is saturated" from "my own context
+// ended" and back off instead of looping.
+var ErrBudgetBusy = errors.New("fabric: host budget busy")
 
 // ErrBudgetConflict is returned by Budgets.For when a host is already
 // registered with a different configuration.
@@ -75,12 +89,16 @@ type BudgetOption func(*HostBudget)
 func WithBudgetClock(c Clock) BudgetOption { return func(b *HostBudget) { b.clock = c } }
 
 // WithStreamLease makes a slot held by an open read stream (Limited ReadFile /
-// OpenSeekable) be released automatically after d if the holder has not closed
-// the stream by then (0 = off, the default: a slot is held until Close). It
-// bounds the blast radius of a leaked, never-closed stream, which would
-// otherwise starve every protocol sharing the host. The stream itself stays
-// readable after the lease expired; only its slot is gone, so while it is
-// still read the host may see slightly more than MaxConcurrent operations.
+// OpenSeekable) be released automatically once the stream has been IDLE for d:
+// no byte read (Read, ReadAt or WriteTo, which counts while it copies) and not
+// closed (0 = off, the default: a slot is held until Close). Every read resets
+// the clock, so a stream that is actively read - a two-hour movie - keeps its
+// slot for its whole life and the cap holds; only a leaked, never-closed or
+// abandoned stream loses it, which is what bounds the blast radius of a leak
+// that would otherwise starve every protocol sharing the host. An expired
+// stream stays readable; its slot is gone for good (reading it again does not
+// take a slot back), so the host may see MaxConcurrent+1 operations from the
+// moment a stream is read after it had been idle past d.
 // BudgetStats.LeaseExpired counts the slots taken back this way.
 func WithStreamLease(d time.Duration) BudgetOption { return func(b *HostBudget) { b.lease = d } }
 
@@ -128,7 +146,7 @@ func (b *HostBudget) Acquire(ctx context.Context) (release func(), err error) {
 		b.giveBack(start, reused)
 		b.mu.Unlock()
 		<-b.sem
-		return nil, fmt.Errorf("fabric: start slot %v is after the deadline: %w", start.Sub(now), context.DeadlineExceeded)
+		return nil, fmt.Errorf("%w: start slot %v is after the deadline: %w", ErrBudgetBusy, start.Sub(now), context.DeadlineExceeded)
 	}
 	wait := start.Sub(now)
 	b.acquired++
@@ -143,6 +161,12 @@ func (b *HostBudget) Acquire(ctx context.Context) (release func(), err error) {
 			return nil, err
 		}
 	}
+	return b.newHold(), nil
+}
+
+// newHold registers a slot whose wait is over as held and returns its
+// idempotent release. The concurrency token must already be taken.
+func (b *HostBudget) newHold() func() {
 	b.mu.Lock()
 	b.nextID++
 	id := b.nextID
@@ -156,7 +180,33 @@ func (b *HostBudget) Acquire(ctx context.Context) (release func(), err error) {
 			b.mu.Unlock()
 			<-b.sem
 		})
-	}, nil
+	}
+}
+
+// TryAcquire takes one concurrency slot and one start slot ONLY IF both are
+// available right now: it never waits and never reserves. It reports ok=false,
+// leaving the schedule untouched, when all MaxConcurrent slots are held or the
+// next start slot lies in the future. It is how Limited budgets the connection
+// probe: a probe is worth running only when it costs the host nothing it could
+// not afford, and a busy budget must never turn into an "unhealthy" verdict.
+func (b *HostBudget) TryAcquire() (release func(), ok bool) {
+	select {
+	case b.sem <- struct{}{}:
+	default:
+		return nil, false
+	}
+	b.mu.Lock()
+	now := b.clock.Now()
+	start, reused := b.takeSlot(now)
+	if start.After(now) {
+		b.giveBack(start, reused)
+		b.mu.Unlock()
+		<-b.sem
+		return nil, false
+	}
+	b.acquired++
+	b.mu.Unlock()
+	return b.newHold(), true
 }
 
 // takeSlot returns the start time for a caller arriving at now: the earliest
@@ -181,8 +231,11 @@ func (b *HostBudget) takeSlot(now time.Time) (start time.Time, reused bool) {
 
 // giveBack returns a start slot nobody used. b.mu is held.
 func (b *HostBudget) giveBack(start time.Time, reused bool) {
-	if !reused && b.nextSlot.Equal(start.Add(b.interval)) {
-		b.nextSlot = start // the last reservation: wind the front back
+	if b.nextSlot.Equal(start.Add(b.interval)) {
+		// The last reservation - whether it was a fresh slot or a returned one
+		// that another caller had reused and that became the tail: wind the
+		// front back, so a slot nobody used is not waited for.
+		b.nextSlot = start
 		// and wind further while the slots just before it are free
 		for n := len(b.free); n > 0 && b.free[n-1].Add(b.interval).Equal(b.nextSlot); n = len(b.free) {
 			b.nextSlot = b.free[n-1]
@@ -200,18 +253,65 @@ func (b *HostBudget) giveBack(start time.Time, reused bool) {
 	b.free[i] = start
 }
 
-// leaseRelease arranges for release to run after the stream lease, if any.
-func (b *HostBudget) leaseRelease(release func()) func() {
+// lease is the idle timer of one stream slot (WithStreamLease).
+type lease struct {
+	b       *HostBudget
+	d       time.Duration
+	release func()
+
+	mu   sync.Mutex
+	last time.Time // wall clock of the last activity; the timer is real time, see WithStreamLease
+	done bool      // closed, or expired
+	t    *time.Timer
+}
+
+// leaseRelease arranges for release to run once the stream has been idle for
+// the stream lease, if any. It returns the function to call when the stream is
+// closed and the function to call for every read (nil when there is no lease).
+func (b *HostBudget) leaseRelease(release func()) (onClose func(), touch func()) {
 	if b.lease <= 0 {
-		return release
+		return release, nil
 	}
-	t := time.AfterFunc(b.lease, func() {
-		b.mu.Lock()
-		b.leased++
-		b.mu.Unlock()
-		release()
-	})
-	return func() { t.Stop(); release() }
+	l := &lease{b: b, d: b.lease, release: release, last: time.Now()}
+	l.mu.Lock()
+	l.t = time.AfterFunc(l.d, l.fire)
+	l.mu.Unlock()
+	return l.close, l.touch
+}
+
+func (l *lease) touch() {
+	l.mu.Lock()
+	if !l.done {
+		l.last = time.Now()
+	}
+	l.mu.Unlock()
+}
+
+func (l *lease) fire() {
+	l.mu.Lock()
+	if l.done {
+		l.mu.Unlock()
+		return
+	}
+	if idle := time.Since(l.last); idle < l.d { // read meanwhile: wait out the rest
+		l.t.Reset(l.d - idle)
+		l.mu.Unlock()
+		return
+	}
+	l.done = true
+	l.mu.Unlock()
+	l.b.mu.Lock()
+	l.b.leased++
+	l.b.mu.Unlock()
+	l.release()
+}
+
+func (l *lease) close() {
+	l.mu.Lock()
+	l.done = true
+	l.t.Stop()
+	l.mu.Unlock()
+	l.release()
 }
 
 // BudgetStats is a point-in-time view of a HostBudget.

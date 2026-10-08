@@ -118,6 +118,15 @@ type Config struct {
 	MaxReplyBytes int `json:"-"`
 	// MaxListEntries bounds the lines of one listing; 0 selects DefaultMaxListEntries.
 	MaxListEntries int `json:"-"`
+	// MaxListBytes bounds the bytes of one listing (all its lines); 0 selects DefaultMaxListBytes. The entry cap alone
+	// would allow 1,048,576 lines of 16 KiB.
+	MaxListBytes int `json:"-"`
+	// LoginBackoff is how long logins to this host and user are suspended, for every client of the process, after a
+	// password attempt whose outcome is unknown (see loginguard.go); 0 selects DefaultLoginBackoff, negative disables.
+	LoginBackoff time.Duration `json:"-"`
+	// OnWarning, when set, is called after a listing that skipped entries (a name with a line break, a name that cannot be
+	// addressed): see ListingWarning. It is called on the goroutine of the listing; it must not call the client.
+	OnWarning func(ListingWarning) `json:"-"`
 	// DisableEPSV forces PASV (servers whose EPSV is broken).
 	DisableEPSV bool `json:"disable_epsv"`
 }
@@ -132,6 +141,7 @@ type PublicConfig struct {
 	TLSMode           string `json:"tls_mode"`
 	TrustedLAN        bool   `json:"trusted_lan"`
 	AllowDegradedList bool   `json:"allow_degraded_list"`
+	DisableEPSV       bool   `json:"disable_epsv"`
 }
 
 type connState int
@@ -157,6 +167,9 @@ type Client struct {
 	degraded      bool
 	abort         func() // aborts the open stream, if any (Disconnect)
 	closeWhenIdle bool   // a Disconnect timed out: whoever releases the session closes the connection
+	gen           uint64 // bumped by every Disconnect: a connect that started before it must not publish its connection
+	warnings      []ListingWarning
+	skipped       int64
 }
 
 var (
@@ -180,7 +193,8 @@ func (c *Client) port() int {
 }
 
 func (c *Client) opts() protoOpts {
-	o := protoOpts{dialTimeout: c.config.DialTimeout, ioTimeout: c.config.IOTimeout, maxReply: c.config.MaxReplyBytes, disableEPSV: c.config.DisableEPSV}
+	o := protoOpts{dialTimeout: c.config.DialTimeout, ioTimeout: c.config.IOTimeout, maxReply: c.config.MaxReplyBytes, disableEPSV: c.config.DisableEPSV,
+		loginBackoff: c.config.LoginBackoff}
 	if o.dialTimeout <= 0 {
 		o.dialTimeout = DefaultDialTimeout
 	}
@@ -198,6 +212,13 @@ func (c *Client) maxEntries() int {
 		return c.config.MaxListEntries
 	}
 	return DefaultMaxListEntries
+}
+
+func (c *Client) maxBytes() int {
+	if c.config.MaxListBytes > 0 {
+		return c.config.MaxListBytes
+	}
+	return DefaultMaxListBytes
 }
 
 // acquire takes the session or gives up when ctx is done.
@@ -294,10 +315,18 @@ func (c *Client) connect(ctx context.Context) error {
 	default:
 		return fmt.Errorf("%w: %q", ErrUnsupportedTLSMode, mode)
 	}
+	key := loginKeyFor(cfg.Host, c.port(), cfg.Username)
+	if rem := loginBackoffs.remaining(key); rem > 0 {
+		// before the credential is even resolved and before any socket: no password can be sent again (WF24 G3)
+		return loginBackoffError(cfg.Host, c.port(), rem)
+	}
 	pw, err := c.password(ctx)
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
+	gen := c.gen
+	c.mu.Unlock()
 
 	var pins []CertPin
 	var tlsCfg *tls.Config
@@ -317,6 +346,7 @@ func (c *Client) connect(ctx context.Context) error {
 		m, _ := mapTLSError(err, cfg.Host, pins)
 		return m
 	}
+	p.loginKey = key
 	fail := func(err error) error {
 		p.quit()
 		return err
@@ -336,6 +366,7 @@ func (c *Client) connect(ctx context.Context) error {
 	if err := p.login(ctx, cfg.Username, pw, false); err != nil {
 		return fail(err)
 	}
+	loginBackoffs.clear(key) // a credential verdict was reached: any earlier doubt is over
 	root := ""
 	if cfg.Path != "" {
 		if _, _, err := p.cmd(ctx, []int{250}, "CWD %s", cfg.Path); err != nil {
@@ -352,6 +383,12 @@ func (c *Client) connect(ctx context.Context) error {
 	}
 	p.endPhase()
 	c.mu.Lock()
+	if c.gen != gen {
+		// a Disconnect ran while this connection was being established (WF24 G6): it wins, the new connection is closed
+		c.mu.Unlock()
+		p.quit()
+		return fmt.Errorf("%w: Disconnect was called while the connection was being established", ErrNotConnected)
+	}
 	old := c.p
 	c.p, c.state, c.root = p, stateUp, strings.TrimSuffix(root, "/")
 	c.degraded = !p.mlstOK()
@@ -383,6 +420,7 @@ func (c *Client) Connect(ctx context.Context) error {
 func (c *Client) Disconnect(ctx context.Context) error {
 	c.mu.Lock()
 	c.state = stateDown
+	c.gen++
 	abort := c.abort
 	c.mu.Unlock()
 	if abort != nil {
@@ -688,7 +726,9 @@ func (c *Client) OpenSeekable(ctx context.Context, p string) (client.ReadSeekClo
 		}
 		n, perr := strconv.ParseInt(strings.TrimSpace(strings.Join(lines, " ")), 10, 64)
 		if perr != nil || n < 0 {
-			return fmt.Errorf("ftp: unreadable SIZE reply %q", flat(strings.Join(lines, " ")))
+			// a 213 whose text is not a size is not the answer to our SIZE: the lock-step is in doubt (WF24 K1.e)
+			pr.markBroken()
+			return protoViolation("unreadable SIZE reply %q", flat(strings.Join(lines, " ")))
 		}
 		size = n
 		return nil
@@ -728,12 +768,39 @@ func (s *seeker) Read(p []byte) (int, error) {
 		_ = s.dropStream()
 		return n, err
 	case s.off >= s.size:
-		// everything announced was received: release the session now (the reply is not awaited; see Close)
-		if cerr := s.dropStream(); cerr != nil {
+		// everything announced was received: the transfer is finished AS COMPLETE (its final reply is read and a
+		// negative one is returned), not dropped through the early-close path that accepts any reply (WF24 G4)
+		if cerr := s.finishAtEnd(); cerr != nil {
 			return n, cerr
 		}
 	}
 	return n, nil
+}
+
+// finishAtEnd closes the stream after SIZE bytes were read: the end of the data (EOF) is awaited for at most
+// earlyCloseWait and the transfer is closed as complete, so a final 4yz/5yz reply is an error. A server that sends more
+// than SIZE announced, or does not close the data connection, gets the early-close path (any reply accepted).
+func (s *seeker) finishAtEnd() error {
+	st := s.st
+	s.st = nil
+	if st == nil {
+		return nil
+	}
+	if !st.eof && st.rerr == nil {
+		st.dc.maxWait.Store(int64(earlyCloseWait))
+		var one [1]byte
+		n, err := st.dc.Read(one[:])
+		var ne net.Error
+		switch {
+		case n > 0:
+		case errors.Is(err, io.EOF):
+			st.eof = true
+		case err != nil && errors.As(err, &ne) && ne.Timeout() && st.ctx.Err() == nil && !st.dc.aborted.Load():
+		case err != nil:
+			st.rerr = err
+		}
+	}
+	return st.Close()
 }
 
 func (s *seeker) dropStream() error {
@@ -794,38 +861,167 @@ func toInfo(logicalDir string, e *entry, degraded bool) *client.FileInfo {
 }
 
 // listEntries lists the directory remote (always with an explicit argument: an argument-less LIST lists the login
-// directory, which is not the directory that was asked for).
-func (c *Client) listEntries(ctx context.Context, p *proto, remote string, degraded bool) ([]*entry, error) {
-	var out []*entry
+// directory, which is not the directory that was asked for). logical is the directory as the client names it (warnings).
+func (c *Client) listEntries(ctx context.Context, p *proto, logical, remote string, degraded bool) ([]*entry, error) {
+	acc := &listAcc{}
 	var err error
 	if degraded {
-		err = p.list(ctx, c.maxEntries(), func(line string) error {
-			e, skip, perr := parseListLine(line)
-			if perr == nil && !skip {
-				out = append(out, e)
-			}
-			return perr
-		}, "LIST %s", remote)
+		err = p.list(ctx, c.maxEntries(), c.maxBytes(), func(line string) error { return acc.add(line, true) }, "LIST %s", remote)
 	} else {
-		err = p.list(ctx, c.maxEntries(), func(line string) error {
-			e, perr := parseMLEntry(line)
-			if perr == nil {
-				out = append(out, e)
-			}
-			return perr
-		}, "MLSD %s", remote)
+		err = p.list(ctx, c.maxEntries(), c.maxBytes(), func(line string) error { return acc.add(line, false) }, "MLSD %s", remote)
 	}
 	if err != nil {
 		return nil, mapFTPError(err)
 	}
-	if p.utf8Refused {
-		for _, e := range out {
+	if err := acc.verdict(); err != nil {
+		return nil, err
+	}
+	if !p.utf8On {
+		// the session is not known to be UTF-8 (UTF8 not offered, or OPTS UTF8 ON refused): a name that is not valid
+		// UTF-8 or carries the 0x7f replacement cannot be represented (WF24 G9: checked whatever the reason)
+		for _, e := range acc.entries {
 			if !utf8.ValidString(e.name) || strings.ContainsRune(e.name, 0x7f) {
 				return nil, fmt.Errorf("%w: %q", ErrUTF8Refused, e.name)
 			}
 		}
 	}
-	return out, nil
+	if w := acc.warning(logical); w != nil {
+		c.noteWarning(*w)
+	}
+	return acc.entries, nil
+}
+
+// listAcc collects the lines of one listing. A line without fact structure that cannot be parsed AFTER at least one entry
+// was understood is a FRAGMENT: the rest of a name that contains a line break (the NAS leg of WP-12: one such name made the whole directory
+// fail and lost 189 other entries). Fragments are skipped and counted, and the entry in front of one is dropped too (its
+// name is a truncated one). A listing whose FIRST line cannot be parsed, or in which fragments are more than a tenth of
+// the lines, is not a listing with an odd name but a desynchronised channel: it fails closed (ErrListingIncomplete).
+type listAcc struct {
+	entries       []*entry
+	lines         int
+	sawEntry      bool
+	lastAppended  bool
+	fragments     int
+	truncated     int
+	unaddressable int
+}
+
+func (a *listAcc) add(line string, degraded bool) error {
+	var (
+		e    *entry
+		skip bool
+		perr error
+	)
+	if degraded {
+		e, skip, perr = parseListLine(line)
+	} else {
+		e, perr = parseMLEntry(line)
+	}
+	if perr == nil && skip {
+		return nil // a "total N" line
+	}
+	a.lines++
+	if perr != nil {
+		// A fragment is a line without structure that follows an understood entry. An MLSD line that HAS the fact
+		// structure (a ";") but is invalid (Size=zz) is a damaged entry, not a piece of a name: the listing fails as
+		// before. A LIST line has no marker that tells a name fragment from garbage, so any unparseable one qualifies.
+		if !a.sawEntry || (!degraded && strings.Contains(line, ";")) {
+			return perr
+		}
+		a.fragments++
+		if a.lastAppended {
+			a.entries = a.entries[:len(a.entries)-1]
+			a.truncated++
+			a.lastAppended = false
+		}
+		return nil
+	}
+	a.sawEntry = true
+	if strings.ContainsAny(e.name, "\r\n\x00") {
+		a.unaddressable++ // confine refuses such a path: listing it would only produce an entry nobody can open
+		a.lastAppended = false
+		return nil
+	}
+	a.entries = append(a.entries, e)
+	a.lastAppended = true
+	return nil
+}
+
+// verdict fails a listing that looks desynchronised rather than odd.
+func (a *listAcc) verdict() error {
+	if a.fragments > 8 && a.fragments*10 > a.lines {
+		return fmt.Errorf("%w: %d of %d lines could not be parsed", ErrListingIncomplete, a.fragments, a.lines)
+	}
+	return nil
+}
+
+func (a *listAcc) warning(dir string) *ListingWarning {
+	if a.fragments+a.truncated+a.unaddressable == 0 {
+		return nil
+	}
+	listed := 0
+	for _, e := range a.entries {
+		if e.kind != kindSelf && e.kind != kindParent && visibleName(e.name) {
+			listed++
+		}
+	}
+	return &ListingWarning{Dir: dir, Fragments: a.fragments, Truncated: a.truncated, Unaddressable: a.unaddressable, Listed: listed}
+}
+
+// ErrEntriesSkipped is what a ListingWarning unwraps to.
+var ErrEntriesSkipped = errors.New("ftp: directory entries were skipped")
+
+// ListingWarning reports a listing that succeeded but skipped entries: names that contain a line break (their MLSD line
+// is split in two) or CR, LF or NUL (they cannot be addressed by any later command). It is delivered to
+// Config.OnWarning and kept in Client.Warnings; Client.SkippedEntries counts them. It carries counts and the
+// directory, never a name.
+type ListingWarning struct {
+	Dir           string // the directory as the client names it
+	Fragments     int    // unparseable lines swallowed as the rest of a name that contains a line break
+	Truncated     int    // entries dropped because a fragment followed them (their names were cut)
+	Unaddressable int    // entries whose name contains CR, LF or NUL
+	Listed        int    // entries returned
+}
+
+// Skipped is the number of entries that are missing from the listing (a name with a line break counts once as its
+// truncated head, which is dropped, and once per fragment line; Fragments + Truncated + Unaddressable lines in all).
+func (w ListingWarning) Skipped() int { return w.Fragments + w.Truncated + w.Unaddressable }
+
+func (w ListingWarning) Error() string {
+	return fmt.Sprintf("ftp: listing of %s skipped entries: %d fragment line(s), %d truncated entr(y/ies), %d unaddressable name(s); %d listed",
+		w.Dir, w.Fragments, w.Truncated, w.Unaddressable, w.Listed)
+}
+
+func (w ListingWarning) Unwrap() error { return ErrEntriesSkipped }
+
+const maxKeptWarnings = 16
+
+func (c *Client) noteWarning(w ListingWarning) {
+	c.mu.Lock()
+	c.skipped += int64(w.Skipped())
+	if len(c.warnings) >= maxKeptWarnings {
+		c.warnings = c.warnings[1:]
+	}
+	c.warnings = append(c.warnings, w)
+	cb := c.config.OnWarning
+	c.mu.Unlock()
+	if cb != nil {
+		cb(w)
+	}
+}
+
+// Warnings returns the most recent listing warnings (at most 16).
+func (c *Client) Warnings() []ListingWarning {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]ListingWarning(nil), c.warnings...)
+}
+
+// SkippedEntries is the number of listing lines/entries skipped over the life of this client (see ListingWarning).
+func (c *Client) SkippedEntries() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.skipped
 }
 
 func visibleName(n string) bool {
@@ -847,7 +1043,7 @@ func (c *Client) ListDirectory(ctx context.Context, p string) ([]*client.FileInf
 		c.mu.Lock()
 		c.degraded = degraded
 		c.mu.Unlock()
-		entries, e := c.listEntries(ctx, pr, remote, degraded)
+		entries, e := c.listEntries(ctx, pr, logical, remote, degraded)
 		if e != nil {
 			return e
 		}
@@ -868,7 +1064,7 @@ func (c *Client) ListDirectory(ctx context.Context, p string) ([]*client.FileInf
 // statViaParent finds name in the listing of its parent. It settles an ambiguous 550 (RFC 959 uses it for "absent"
 // and for "no access"): present means the file exists, absent in a readable parent means it does not.
 func (c *Client) statViaParent(ctx context.Context, p *proto, logical, remote string, degraded bool) (*client.FileInfo, bool, error) {
-	entries, err := c.listEntries(ctx, p, path.Dir(remote), degraded)
+	entries, err := c.listEntries(ctx, p, path.Dir(logical), path.Dir(remote), degraded)
 	if err != nil {
 		return nil, false, err
 	}
@@ -907,12 +1103,20 @@ func (c *Client) GetFileInfo(ctx context.Context, p string) (*client.FileInfo, e
 			}
 			ents, perr := mlstEntries(lines)
 			if perr != nil {
+				// a reply of the right code but the wrong shape: it may be somebody else's answer, so every later
+				// reply could be one behind - the connection is dropped (WF24 G1(b))
+				pr.markBroken()
 				return perr
 			}
 			if len(ents) != 1 {
-				return fmt.Errorf("%w: MLST returned %d entries for one path", ErrListingIncomplete, len(ents))
+				pr.markBroken()
+				return listViolation("MLST returned %d entries for one path", len(ents))
 			}
 			e0 := ents[0]
+			if logical != "/" && !mlstNameMatches(e0.name, remote) {
+				pr.markBroken()
+				return protoViolation("the MLST reply describes another file than the one asked for")
+			}
 			e0.name = path.Base(logical)
 			fi = toInfo(path.Dir(logical), e0, false)
 			fi.Path = logical
@@ -1057,7 +1261,7 @@ func (c *Client) GetConfig() interface{} {
 	}
 	return &PublicConfig{
 		Host: c.config.Host, Port: c.port(), Username: c.config.Username, CredentialRef: c.config.CredentialRef,
-		Path: c.config.Path, TLSMode: mode, TrustedLAN: c.config.TrustedLAN, AllowDegradedList: c.config.AllowDegradedList,
+		Path: c.config.Path, TLSMode: mode, TrustedLAN: c.config.TrustedLAN, AllowDegradedList: c.config.AllowDegradedList, DisableEPSV: c.config.DisableEPSV,
 	}
 }
 

@@ -31,6 +31,7 @@ import (
 
 type authCheck struct {
 	uid, gid uint32
+	gids     []uint32 // the supplementary gids the client must send, VALUES and order (an uid/gid swap or a shifted gid must not pass)
 	machine  string
 	log      *os.File
 	mu       sync.Mutex
@@ -157,9 +158,33 @@ func (a *authCheck) verify(rec []byte) error {
 	if rest, _ := io.ReadAll(b); len(rest) != 0 {
 		return fmt.Errorf("%d trailing bytes after the AUTH_SYS body", len(rest))
 	}
-	if uid != a.uid || gid != a.gid || mach != a.machine {
-		return fmt.Errorf("prog %d proc %d: credential uid=%d gid=%d machine=%q, want %d/%d/%q", hdr[3], hdr[5], uid, gid, mach, a.uid, a.gid, a.machine)
+	if uid != a.uid || gid != a.gid || mach != a.machine || !equalU32(gids, a.gids) {
+		return fmt.Errorf("prog %d proc %d: credential uid=%d gid=%d machine=%q gids=%v, want %d/%d/%q/%v", hdr[3], hdr[5], uid, gid, mach, gids, a.uid, a.gid, a.machine, a.gids)
 	}
-	a.logf("OK prog=%d proc=%d uid=%d gid=%d machine=%s gids=%d", hdr[3], hdr[5], uid, gid, mach, len(gids))
+	a.logf("OK prog=%d proc=%d uid=%d gid=%d machine=%s gids=%s", hdr[3], hdr[5], uid, gid, mach, joinU32(gids))
 	return nil
+}
+
+func equalU32(a, b []uint32) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// joinU32 renders a gid list as 4,24,3456 (empty list: the empty string).
+func joinU32(v []uint32) string {
+	var b bytes.Buffer
+	for i, x := range v {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		fmt.Fprintf(&b, "%d", x)
+	}
+	return b.String()
 }

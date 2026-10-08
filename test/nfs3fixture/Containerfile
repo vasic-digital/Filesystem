@@ -2,7 +2,7 @@
 # Base is the IMG-GO digest of build/containers/images.lock.yaml (golang 1.25-bookworm).
 FROM docker.io/library/golang@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS build
 WORKDIR /src
-COPY go.mod go.sum main.go ./
+COPY go.mod go.sum *.go ./
 RUN CGO_ENABLED=0 GOTOOLCHAIN=local go build -trimpath -ldflags='-s -w' -o /nfs3fixture .
 
 FROM scratch

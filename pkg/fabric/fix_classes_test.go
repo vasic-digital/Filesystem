@@ -319,7 +319,7 @@ func TestRetryPolicy_DelayClosedFormMatchesDefinition(t *testing.T) {
 	}
 }
 
-// naiveDelay is the specification: double, saturate at MaxInt64, then cap.
+// naiveDelay is the specification: double, saturate at MaxInt64, cap, then raise to MinRetryDelay.
 func naiveDelay(base, capd time.Duration, attempt int) time.Duration {
 	d := base
 	for i := 1; i < attempt; i++ {
@@ -331,6 +331,9 @@ func naiveDelay(base, capd time.Duration, attempt int) time.Duration {
 	}
 	if capd > 0 && d > capd {
 		d = capd
+	}
+	if d < fabric.MinRetryDelay { // round 3 (N5): the effective delay is never below the floor
+		d = fabric.MinRetryDelay
 	}
 	return d
 }

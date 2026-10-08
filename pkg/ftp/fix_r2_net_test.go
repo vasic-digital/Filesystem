@@ -836,19 +836,9 @@ func TestLogin_PASSReplies_ClassifiedByCode(t *testing.T) {
 	}
 }
 
-func TestLogin_USER530_IsAuth(t *testing.T) {
-	s := newFakeServer(t)
-	s.setHook(func(ss *session, verb, arg string) (bool, bool) {
-		if verb == "USER" {
-			ss.reply("530 User not allowed to log in")
-			return true, true
-		}
-		return false, true
-	})
-	err := NewFTPClient(cfgFor(s, pinned(t, s))).Connect(ctx5(t))
-	require.Error(t, err)
-	assert.Equal(t, fabric.ClassAuth, fabric.Classify(err))
-}
+// (WF24 G2, fix round 3) TestLogin_USER530_IsAuth asserted ClassAuth for a 530 at USER; no password is sent at that point, so
+// it can neither be a lockout nor a wrong password: the class is permanent. See fix_r3_login_test.go
+// (TestR3_K2_USER530_IsNotAuth_NoPasswordWasSent and the full phase table).
 
 func TestLogin_ConfigRefusals_AreNotAuthFailures_D12(t *testing.T) {
 	for _, verb := range []string{"PROT", "PBSZ", "TYPE"} {

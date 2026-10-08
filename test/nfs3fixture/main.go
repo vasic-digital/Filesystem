@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/go-git/go-billy/v5"
@@ -127,6 +128,7 @@ func main() {
 	authlog := flag.String("authlog", "", "with -authsys: append one OK/VIOLATION line per checked call to this file")
 	authuid := flag.Uint("authuid", 1000, "with -authsys: the uid the client must send")
 	authgid := flag.Uint("authgid", 1000, "with -authsys: the gid the client must send")
+	authgids := flag.String("authgids", "", "with -authsys: the supplementary gids the client must send, comma separated, in order (empty = none)")
 	authmachine := flag.String("authmachine", "catalogizer", "with -authsys: the machine name the client must send")
 	flag.Parse()
 	fs := build()
@@ -154,7 +156,18 @@ func main() {
 		if err != nil {
 			log.Fatal(err)
 		}
-		chk := &authCheck{uid: uint32(*authuid), gid: uint32(*authgid), machine: *authmachine, log: lf}
+		var gids []uint32
+		for _, f := range strings.Split(*authgids, ",") {
+			if f = strings.TrimSpace(f); f == "" {
+				continue
+			}
+			n, perr := strconv.ParseUint(f, 10, 32)
+			if perr != nil {
+				log.Fatalf("-authgids: %q is not a gid: %v", f, perr)
+			}
+			gids = append(gids, uint32(n))
+		}
+		chk := &authCheck{uid: uint32(*authuid), gid: uint32(*authgid), gids: gids, machine: *authmachine, log: lf}
 		log.Fatal(nfs.Serve(tapListener{Listener: ln, chk: chk}, sysHandler{h}))
 	}
 	log.Fatal(nfs.Serve(ln, h))

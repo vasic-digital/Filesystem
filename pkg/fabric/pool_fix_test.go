@@ -197,18 +197,20 @@ func TestPool_RejectedLoginIsNotRepeatedAcrossBorrows(t *testing.T) {
 	if f.conn.Load() != 1 {
 		t.Fatalf("%d login attempts for 50 borrows after an authentication failure, want 1", f.conn.Load())
 	}
-	// GetClientContext too, and another root is independent
+	// GetClientContext too, and another ACCOUNT is independent (round 3, N3:
+	// the memory is per account, so a second root of the SAME account is not
+	// independent - see TestR3_RejectedLoginIsSharedByTheRootsOfOneAccount)
 	if _, err := p.GetClientContext(context.Background(), cfgFor("a")); fabric.Classify(err) != fabric.ClassAuth {
 		t.Fatalf("err=%v", err)
 	}
 	if f.conn.Load() != 1 {
 		t.Fatal("GetClientContext logged in again")
 	}
-	if _, err := p.GetClient(cfgFor("b")); fabric.Classify(err) != fabric.ClassAuth {
-		t.Fatalf("root b: %v", err)
+	if _, err := p.GetClient(cfgForUser("b", "other-account")); fabric.Classify(err) != fabric.ClassAuth {
+		t.Fatalf("account b: %v", err)
 	}
 	if f.conn.Load() != 2 {
-		t.Fatalf("root b must get its own single attempt, connects=%d", f.conn.Load())
+		t.Fatalf("another account must get its own single attempt, connects=%d", f.conn.Load())
 	}
 }
 

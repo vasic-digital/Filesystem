@@ -107,9 +107,12 @@ func (o Op) stream() bool { return o.valid() && opTable[o].stream }
 // in canonical form (RFC 5952 text, IPv4-mapped IPv6 unmapped to IPv4), so
 // "::1" and "0:0:0:0:0:0:0:1", or "192.168.1.5" and "::ffff:192.168.1.5",
 // share one key. Empty input is an error so that a missing host can never
-// silently share a budget, and so is anything that is not a bare host or
-// host:port (a URL, a path, user@host, whitespace or control characters): a
-// URL would collapse every host of a scheme into one key.
+// silently share a budget, and so is anything that is not a bare host,
+// host:port or [ipv6]:port (a URL, a path, user@host, whitespace or control
+// characters, an unterminated bracket, text after the closing bracket, a
+// non-numeric or out-of-range port, a bracketed name, several colons that are
+// not an IPv6 literal): a URL would collapse every host of a scheme into one
+// key, and a malformed form must not silently become a key of its own.
 //
 // Names are NOT resolved: "nas", "nas.local" and the IP of the same machine
 // get three keys. Callers that reach one machine under several names must
@@ -127,12 +130,35 @@ func HostKey(hostport string) (string, error) {
 	if strings.Contains(h, "://") {
 		return "", fmt.Errorf("fabric: %q is a URL, want host or host:port", hostport)
 	}
-	if strings.HasPrefix(h, "[") {
-		if i := strings.Index(h, "]"); i > 0 {
-			h = h[1:i]
+	switch {
+	case strings.HasPrefix(h, "["):
+		// "[v6]" or "[v6]:port": the brackets enclose an IP literal and nothing
+		// but an optional ":port" may follow the closing bracket.
+		i := strings.Index(h, "]")
+		if i < 0 {
+			return "", fmt.Errorf("fabric: %q has an unterminated '['", hostport)
 		}
-	} else if strings.Count(h, ":") == 1 {
-		h = h[:strings.Index(h, ":")]
+		rest := h[i+1:]
+		h = h[1:i]
+		if _, err := netip.ParseAddr(h); err != nil {
+			return "", fmt.Errorf("fabric: %q: the bracketed part must be an IP literal", hostport)
+		}
+		if rest != "" && (rest[0] != ':' || !validPort(rest[1:])) {
+			return "", fmt.Errorf("fabric: %q: only :port may follow the closing bracket", hostport)
+		}
+	case strings.Count(h, ":") == 0:
+		// a bare host name or IPv4 address
+	case strings.Count(h, ":") == 1:
+		i := strings.Index(h, ":")
+		if !validPort(h[i+1:]) {
+			return "", fmt.Errorf("fabric: %q has an invalid port", hostport)
+		}
+		h = h[:i]
+	default:
+		// several colons and no brackets: only a bare IPv6 literal is valid
+		if _, err := netip.ParseAddr(h); err != nil {
+			return "", fmt.Errorf("fabric: %q is not an IPv6 literal (use [addr]:port to give a port)", hostport)
+		}
 	}
 	h = strings.ToLower(strings.TrimSuffix(h, "."))
 	if h == "" {
@@ -142,4 +168,19 @@ func HostKey(hostport string) (string, error) {
 		h = a.Unmap().String()
 	}
 	return h, nil
+}
+
+// validPort reports whether s is a decimal TCP port, 1..65535.
+func validPort(s string) bool {
+	if s == "" || len(s) > 5 {
+		return false
+	}
+	n := 0
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+		n = n*10 + int(r-'0')
+	}
+	return n >= 1 && n <= 65535
 }

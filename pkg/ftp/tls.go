@@ -70,10 +70,63 @@ func (e *CertMismatchError) Error() string {
 	return fmt.Sprintf("ftp: certificate for %s CHANGED: server presented %s, pinned %s", e.Host, e.Presented, strings.Join(e.Pinned, ","))
 }
 
-// DefaultPinStore is the store the factory hands to the clients it creates (pkg/factory). The application sets it
-// once at start, before any client connects; nil means "no store": every explicit-TLS root is then refused with
-// ErrNoPinStore (fail closed).
+// DefaultPinStore is the process-wide store the factory's clients use (pkg/factory hands them DeferredDefaultPinStore,
+// which reads this variable at every Lookup, so it may be set after a client was created and before it connects). The
+// application sets it once at start, before any client connects; nil means "no store": every explicit-TLS root is then
+// refused with ErrNoPinStore (fail closed).
 var DefaultPinStore PinStore
+
+// DeferredDefaultPinStore is a PinStore that forwards Lookup to the DefaultPinStore variable AT CALL TIME (WF24 P3: the
+// factory used to copy the variable when it created the client, so a store set afterwards was ignored). A nil
+// DefaultPinStore makes every Lookup fail with ErrNoPinStore, which refuses the connection before any credential is
+// sent. Record and Remove are forwarded the same way.
+var DeferredDefaultPinStore PinStore = deferredPinStore{}
+
+type deferredPinStore struct{}
+
+func (deferredPinStore) get() (PinStore, error) {
+	if s := DefaultPinStore; s != nil {
+		return s, nil
+	}
+	return nil, ErrNoPinStore
+}
+
+func (d deferredPinStore) Lookup(hostport string) ([]CertPin, error) {
+	s, err := d.get()
+	if err != nil {
+		return nil, err
+	}
+	return s.Lookup(hostport)
+}
+
+func (d deferredPinStore) Record(hostport string, pin CertPin) error {
+	s, err := d.get()
+	if err != nil {
+		return err
+	}
+	return s.Record(hostport, pin)
+}
+
+func (d deferredPinStore) Remove(hostport, fingerprint string) error {
+	s, err := d.get()
+	if err != nil {
+		return err
+	}
+	return s.Remove(hostport, fingerprint)
+}
+
+// checkPinName enforces "one TLS server name per host" at the store: a pin for a certificate valid for ANOTHER name
+// than an existing pin of the host is refused (WF24 G10: Pin guarded it, Record did not, so a hand-built or imported pin
+// file could hold two names and the second one won).
+func checkPinName(existing []CertPin, pin CertPin) error {
+	for _, e := range existing {
+		if e.ServerName != "" && pin.ServerName != "" && e.ServerName != pin.ServerName &&
+			NormalizeFingerprint(e.Fingerprint) != NormalizeFingerprint(pin.Fingerprint) {
+			return fmt.Errorf("%w (pinned %q, new certificate %q)", ErrPinNameConflict, e.ServerName, pin.ServerName)
+		}
+	}
+	return nil
+}
 
 // PinStore persists certificate pins. Implementations must be safe for concurrent use.
 type PinStore interface {
@@ -132,6 +185,9 @@ func (s *MemPinStore) Record(hostport string, pin CertPin) error {
 		if NormalizeFingerprint(p.Fingerprint) == NormalizeFingerprint(pin.Fingerprint) {
 			return nil
 		}
+	}
+	if err := checkPinName(s.pins[hostport], pin); err != nil {
+		return err
 	}
 	s.pins[hostport] = append(s.pins[hostport], pin)
 	return nil
@@ -236,6 +292,9 @@ func (s *FilePinStore) Record(hostport string, pin CertPin) error {
 			return nil
 		}
 	}
+	if err := checkPinName(m[hostport], pin); err != nil {
+		return err
+	}
 	m[hostport] = append(m[hostport], pin)
 	return s.save(m)
 }
@@ -268,14 +327,17 @@ func newTLSConfig(host string, pins []CertPin) *tls.Config {
 	pool := x509.NewCertPool()
 	var fps []string
 	serverName := host
+	named := false
 	for _, p := range pins {
 		if cert, err := x509.ParseCertificate(p.CertDER); err == nil {
 			pool.AddCert(cert)
 			fps = append(fps, NormalizeFingerprint(Fingerprint(cert)))
 		}
-		// One server name is verified per host (Pin refuses a second, different name); the first pin's name wins.
-		if serverName == host && p.ServerName != "" {
+		// One server name is verified per host (Pin and the stores refuse a second, different name); the first pin that
+		// has a name wins, even when that name equals the host (WF24 G10).
+		if !named && p.ServerName != "" {
 			serverName = p.ServerName
+			named = true
 		}
 	}
 	return &tls.Config{

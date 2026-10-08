@@ -175,8 +175,17 @@ func (c *Config) defaults() {
 // nobodyID is the AUTH_SYS uid/gid used when none is configured.
 const nobodyID = 65534
 
+// maxPipelineLimit bounds Config.MaxPipeline: READs in flight per open file, each up to maxReadChunk.
+const maxPipelineLimit = 64
+
 // validate refuses limits that cannot work together.
 func (c *Config) validate() error {
+	if c.MaxPipeline > maxPipelineLimit {
+		return fmt.Errorf("nfs3: MaxPipeline %d exceeds the limit %d (every in-flight READ can hold up to 1 MiB)", c.MaxPipeline, maxPipelineLimit)
+	}
+	if c.DirCount > c.DirMaxCount {
+		return fmt.Errorf("nfs3: DirCount %d exceeds DirMaxCount %d (RFC 1813 3.3.17: dircount is the directory-information part of maxcount)", c.DirCount, c.DirMaxCount)
+	}
 	if c.MaxRecord < 4*recordHeadroom {
 		return fmt.Errorf("nfs3: MaxRecord %d is below the minimum %d", c.MaxRecord, 4*recordHeadroom)
 	}
@@ -209,17 +218,24 @@ type Client struct {
 	fsinfo     FSInfo
 	cache      map[string]cacheEntry // directory path -> handle
 
-	xid         atomic.Uint32 // one xid sequence for every connection of this client
-	lastNFSPort atomic.Int64  // local port of the most recent NFS connection
-	vanished    atomic.Int64  // listing entries that disappeared between READDIRPLUS and LOOKUP
-	remountMu   sync.Mutex
+	xid         atomic.Uint32    // one xid sequence for every connection of this client
+	lastNFSPort atomic.Int64     // local port of the most recent NFS connection
+	vanished    atomic.Int64     // listing entries that disappeared between READDIRPLUS and LOOKUP
+	remountSem  chan struct{}    // one remount at a time; a channel so that a waiter honours its context
+	cacheGen    uint64           // last handle-cache generation handed out (under mu)
 	now         func() time.Time // clock of the handle cache (tests replace it)
 }
 
-// cacheEntry is one remembered directory handle and when it was learned.
+// cacheEntry is one remembered directory handle and when it was learned. gen identifies the
+// handle: it changes whenever the path gets a handle that differs from the remembered one (or none
+// was remembered). pgen is the gen of the PARENT entry this entry was learned under. An entry is
+// trusted only while its parent entry still has that gen (see Client.validLocked): a child learned
+// under an old directory can never be reached through a new directory of the same path.
 type cacheEntry struct {
-	h  Handle
-	at time.Time
+	h    Handle
+	at   time.Time
+	gen  uint64
+	pgen uint64
 }
 
 var (
@@ -243,13 +259,15 @@ func New(cfg Config) (*Client, error) {
 	}
 	var b [4]byte
 	_, _ = rand.Read(b[:])
-	c := &Client{cfg: cfg, cache: map[string]cacheEntry{}, now: time.Now}
+	c := &Client{cfg: cfg, cache: map[string]cacheEntry{}, now: time.Now, remountSem: make(chan struct{}, 1)}
 	c.xid.Store(binary.BigEndian.Uint32(b[:]))
 	return c, nil
 }
 
-// VanishedEntries counts listing entries that were skipped because they disappeared (NOENT or
-// STALE) between the READDIRPLUS that named them and the LOOKUP that fetched their attributes.
+// VanishedEntries counts listing entries that were skipped because they disappeared between the
+// READDIRPLUS that named them and the call that fetched their attributes: NOENT answering the
+// LOOKUP, or NOENT, STALE or BADHANDLE answering the GETATTR of the entry's handle (a STALE or
+// BADHANDLE answering the LOOKUP names the directory and fails the listing instead).
 func (c *Client) VanishedEntries() int64 { return c.vanished.Load() }
 
 func (c *Client) cred() authSysCred {
@@ -282,10 +300,21 @@ func (c *Client) dialMode(ctx context.Context, addr string, priv bool) (net.Conn
 // dialPrivileged binds a source port in 512..1023, descending from 1023 as
 // mount.nfs does, and connects from it.
 func dialPrivileged(ctx context.Context, addr string, timeout time.Duration) (net.Conn, error) {
+	return dialPrivilegedFrom(ctx, func(ctx context.Context, port int) (net.Conn, error) {
+		d := net.Dialer{Timeout: timeout, LocalAddr: &net.TCPAddr{Port: port}}
+		return d.DialContext(ctx, "tcp", addr)
+	})
+}
+
+// dialPrivilegedFrom is the port-selection loop of dialPrivileged with the actual bind-and-connect
+// injected (tests drive the loop without the privilege to bind a reserved port).
+func dialPrivilegedFrom(ctx context.Context, dialFrom func(ctx context.Context, port int) (net.Conn, error)) (net.Conn, error) {
 	var last error
 	for p, tries := 1023, 0; p >= 512 && tries < 64; p, tries = p-1, tries+1 {
-		d := net.Dialer{Timeout: timeout, LocalAddr: &net.TCPAddr{Port: p}}
-		conn, err := d.DialContext(ctx, "tcp", addr)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		conn, err := dialFrom(ctx, p)
 		if err == nil {
 			return conn, nil
 		}
@@ -388,8 +417,14 @@ func (c *Client) Connect(ctx context.Context) error {
 			c.mu.Lock()
 			c.privileged = false
 			c.mu.Unlock()
+			if isAccess(err2) {
+				return err2 // the server refused the reserved-port attempt as well: that error says so
+			}
+			// The retry failed for another reason (typically: this process may not bind a reserved
+			// port). The server's ORIGINAL refusal is the operator's real problem and is kept, first.
+			return fmt.Errorf("%w; the retry from a reserved source port then failed: %w", err, err2)
 		}
-		return err2
+		return nil
 	}
 	return err
 }
@@ -464,17 +499,20 @@ func (c *Client) connectOnce(ctx context.Context) (err error) {
 	if err != nil {
 		return c.wrapAccess("mount", local, fmt.Errorf("nfs3: MNT %q: %w", c.cfg.Export, err))
 	}
+	// The server answered MNT with status OK: it now holds a mount record (rmtab) for this client,
+	// whether or not the rest of the reply decodes. From here on, any failure must not leave that
+	// record behind, so a best-effort UMNT is sent on every failure path, a malformed OK reply
+	// (handle longer than 64 bytes, more than 64 flavors) included.
+	mounted := len(res) >= 4 && binary.BigEndian.Uint32(res) == 0
+	defer func() {
+		if err != nil && mounted {
+			c.umnt(ctx, mountPort)
+		}
+	}()
 	root, flavors, err := decodeMnt(c.cfg.Export, res)
 	if err != nil {
 		return c.wrapAccess("mount", local, err)
 	}
-	// MNT succeeded: from here on, any failure must not leave the server-side mount record
-	// behind (rmtab), so a best-effort UMNT is sent on every failure path.
-	defer func() {
-		if err != nil {
-			c.umnt(mountPort)
-		}
-	}()
 	useNone := false
 	if len(flavors) > 0 {
 		hasSys, hasNone := false, false
@@ -534,9 +572,23 @@ func (c *Client) connectOnce(ctx context.Context) (err error) {
 	return nil
 }
 
+// Bounds of the best-effort UMNT that cleans up a failed Connect. The caller's context is
+// honoured while it lives (the cleanup is part of the call it made); once it has ended the cleanup
+// still gets a short grace so that the server's mount record is normally removed, but the caller is
+// never kept waiting for a mount daemon that accepts and does not answer. The call itself is also
+// bounded by CallTimeout (oneShot), so a CallTimeout below these bounds wins.
+const (
+	umntBound          = 2 * time.Second
+	umntCancelledBound = 500 * time.Millisecond
+)
+
 // umnt sends a best-effort UMNT to the MOUNT service on mountPort; failures are ignored.
-func (c *Client) umnt(mountPort int) {
-	uctx, cancel := context.WithTimeout(context.Background(), c.cfg.CallTimeout)
+func (c *Client) umnt(ctx context.Context, mountPort int) {
+	bound := umntBound
+	if ctx.Err() != nil {
+		ctx, bound = context.WithoutCancel(ctx), umntCancelledBound
+	}
+	uctx, cancel := context.WithTimeout(ctx, bound)
 	defer cancel()
 	_, _, _ = c.oneShot(uctx, c.hostPort(mountPort), progMount, versMount, procUmnt, encodeDirpath(c.cfg.Export))
 }
@@ -773,7 +825,7 @@ func splitPath(p string) []string {
 }
 
 // cached returns the remembered handle of directory p. The root handle is always valid; every
-// other entry is trusted for HandleCacheTTL only.
+// other entry is trusted only while validLocked says so.
 func (c *Client) cached(p string) (Handle, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -784,37 +836,62 @@ func (c *Client) cached(p string) (Handle, bool) {
 	if p == "/" {
 		return e.h, true
 	}
-	if c.cfg.HandleCacheTTL < 0 || c.now().Sub(e.at) > c.cfg.HandleCacheTTL {
-		delete(c.cache, p)
+	if !c.validLocked(p, e, c.now()) {
 		return nil, false
 	}
 	return e.h, true
 }
 
-// remember records the handle of directory p. When p already held a DIFFERENT handle (the
-// directory was replaced or renamed over), every remembered descendant of p belongs to the old
-// tree and is dropped with it.
+// validLocked reports whether the entry e of directory p may be trusted. Validity is a property of
+// the whole chain from p up to the root, not of p alone: p's own age is within HandleCacheTTL, its
+// parent entry exists with the generation p was learned under, and that parent is valid in turn. A
+// directory that was replaced (new handle, new generation) therefore takes every entry learned
+// below the old one out of reach, whatever order the entries expired or were evicted in.
+func (c *Client) validLocked(p string, e cacheEntry, now time.Time) bool {
+	for p != "/" {
+		if c.cfg.HandleCacheTTL < 0 || now.Sub(e.at) > c.cfg.HandleCacheTTL {
+			return false
+		}
+		pp := path.Dir(p)
+		pe, ok := c.cache[pp]
+		if !ok || pe.gen != e.pgen {
+			return false
+		}
+		p, e = pp, pe
+	}
+	return true
+}
+
+// remember records the handle of directory p, learned under the entry of its parent. When p
+// already held the same handle it keeps its generation (the entries below it stay valid); when the
+// handle differs, or p was not remembered, p gets a NEW generation: every entry learned below the
+// old one carries the old generation in pgen and is out of reach from this moment (validLocked),
+// whether it is still in the map or not. A path whose parent is not remembered gets pgen 0, which
+// no remembered directory below the root can have, so it is unreachable until its parent is learned
+// again under a new generation.
 func (c *Client) remember(p string, h Handle) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.cfg.HandleCacheTTL < 0 {
+	if c.cfg.HandleCacheTTL < 0 || p == "/" {
 		return
 	}
-	if old, ok := c.cache[p]; ok && !bytes.Equal(old.h, h) {
-		prefix := p + "/"
-		if p == "/" {
-			prefix = "/"
-		}
-		for k := range c.cache {
-			if k != "/" && strings.HasPrefix(k, prefix) {
-				delete(c.cache, k)
+	if len(c.cache) >= handleCacheMax {
+		// Full: start over from the root, keeping the chain of p so that p can still be linked.
+		keep := map[string]cacheEntry{"/": {h: c.root, at: c.now()}}
+		for a := path.Dir(p); a != "/"; a = path.Dir(a) {
+			if e, ok := c.cache[a]; ok {
+				keep[a] = e
 			}
 		}
+		c.cache = keep
 	}
-	if len(c.cache) >= handleCacheMax {
-		c.cache = map[string]cacheEntry{"/": {h: c.root, at: c.now()}}
+	old, had := c.cache[p]
+	gen := old.gen
+	if !had || !bytes.Equal(old.h, h) {
+		c.cacheGen++
+		gen = c.cacheGen
 	}
-	c.cache[p] = cacheEntry{h: h, at: c.now()}
+	c.cache[p] = cacheEntry{h: h, at: c.now(), gen: gen, pgen: c.cache[path.Dir(p)].gen}
 }
 
 func (c *Client) forgetCache() {
@@ -827,8 +904,12 @@ func (c *Client) forgetCache() {
 // handle cache. It is the recovery for a server that re-exported the filesystem or lost its
 // handles; a failure leaves the client unchanged.
 func (c *Client) remount(ctx context.Context) error {
-	c.remountMu.Lock()
-	defer c.remountMu.Unlock()
+	select { // one remount at a time; a waiter still honours its own context
+	case c.remountSem <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-c.remountSem }()
 	var err error
 	mountPort := c.cfg.MountPort
 	if mountPort == 0 {
@@ -888,8 +969,12 @@ func (c *Client) resolve(ctx context.Context, p string) (Handle, Attr, string, e
 				c.forgetCache()
 				continue
 			}
-			if c.remount(ctx) == nil {
+			rerr := c.remount(ctx)
+			if rerr == nil {
 				continue
+			}
+			if cerr := ctx.Err(); cerr != nil {
+				return nil, Attr{}, "", cerr
 			}
 		}
 		return h, a, cp, err
@@ -1001,14 +1086,35 @@ func (c *Client) ListDirectory(ctx context.Context, p string) ([]*client.FileInf
 	}
 }
 
+// attrLeg names the procedure of the attribute fallback of a listing whose error is being judged.
+// Which handle an NFS3ERR_STALE / NFS3ERR_BADHANDLE refers to depends on it (RFC 1813):
+type attrLeg int
+
+const (
+	// legLookup: LOOKUP(dir, name). The only handle in the arguments is the DIRECTORY (section
+	// 3.3.3, diropargs3), so STALE/BADHANDLE means the directory itself is invalid; only NOENT
+	// means that the ENTRY is gone.
+	legLookup attrLeg = iota
+	// legGetattr: GETATTR(h) of the handle the LOOKUP just returned for the entry: any of the
+	// three means the ENTRY is gone.
+	legGetattr
+)
+
 // vanishedErr reports an error that means "this entry no longer exists": a file deleted between
-// the READDIRPLUS that listed it and the LOOKUP that asked for its attributes.
-func vanishedErr(err error) bool {
+// the READDIRPLUS that listed it and the call that asked for its attributes. leg says which call
+// failed, because the same status names a different handle in each.
+func vanishedErr(err error, leg attrLeg) bool {
 	var ne *NFSError
 	if !errors.As(err, &ne) {
 		return false
 	}
-	return ne.Status == NFS3ErrNoEnt || ne.Status == NFS3ErrStale || ne.Status == NFS3ErrBadHandle
+	switch leg {
+	case legLookup:
+		return ne.Status == NFS3ErrNoEnt
+	case legGetattr:
+		return ne.Status == NFS3ErrNoEnt || ne.Status == NFS3ErrStale || ne.Status == NFS3ErrBadHandle
+	}
+	return false
 }
 
 func (c *Client) listOnce(ctx context.Context, dir Handle, cp string) ([]*client.FileInfo, error) {
@@ -1063,16 +1169,18 @@ func (c *Client) listOnce(ctx context.Context, dir Handle, cp string) ([]*client
 			} else { // attributes are optional in entryplus3: ask for them
 				h, la, err := c.lookup(ctx, dir, en.Name)
 				if err != nil {
-					if vanishedErr(err) { // deleted while we were listing: it is not in the directory any more
+					if vanishedErr(err, legLookup) { // deleted while we were listing: it is not in the directory any more
 						c.vanished.Add(1)
 						continue
 					}
+					// Everything else, STALE and BADHANDLE included, names the DIRECTORY handle (see attrLeg):
+					// the listing fails with that error, it is never reported as an empty directory.
 					return nil, err
 				}
 				if la != nil {
 					a = *la
 				} else if a, err = c.getattr(ctx, h); err != nil {
-					if vanishedErr(err) {
+					if vanishedErr(err, legGetattr) {
 						c.vanished.Add(1)
 						continue
 					}

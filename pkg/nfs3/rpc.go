@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -147,6 +148,10 @@ type rpcConn struct {
 	xid      *atomic.Uint32
 	dropped  atomic.Uint64 // replies with no matching call (late, duplicate, unsolicited)
 	localEnd net.Addr
+
+	// failHook is called at the start of fail, before the connection is marked closed. Tests set it (before the first call) to
+	// hold the failing writer at that point, which makes the order "fail before the write slot is released" observable.
+	failHook func()
 }
 
 // newRPCConn starts a connection with a private xid counter whose first call uses firstXID+1.
@@ -174,28 +179,34 @@ func (c *rpcConn) localPort() int {
 	return 0
 }
 
-// callKey names one remote procedure.
-type callKey struct{ prog, proc uint32 }
+// callKey names one remote procedure. A procedure number means something only together with the
+// program AND the version: NFS version 4 procedure 1 is COMPOUND (it carries WRITE, REMOVE and
+// RENAME operations) while version 3 procedure 1 is GETATTR.
+type callKey struct{ prog, vers, proc uint32 }
 
 // allowedCalls is the complete set of remote procedures this client may put on the wire. It is
 // enforced at the single choke point (rpcConn.call) before anything is written, so a new code
-// path that names a write procedure (by constant, by literal or through a variable) is refused
-// at run time with ErrReadOnly and cannot reach the server.
+// path that names a write procedure, or a protocol version in which a procedure number means
+// something else (by constant, by literal or through a variable), is refused at run time with
+// ErrReadOnly and cannot reach the server.
 var allowedCalls = map[callKey]bool{
-	{progPortmap, procPmapGetport}: true,
-	{progMount, procMnt}:           true,
-	{progMount, procUmnt}:          true,
-	{progMount, procMntExport}:     true,
-	{progNFS, procNull}:            true,
-	{progNFS, procGetattr}:         true,
-	{progNFS, procLookup}:          true,
-	{progNFS, procAccess}:          true,
-	{progNFS, procRead}:            true,
-	{progNFS, procReaddirplus}:     true,
-	{progNFS, procFsinfo}:          true,
+	{progPortmap, versPortmap, procPmapGetport}: true,
+	{progMount, versMount, procMnt}:             true,
+	{progMount, versMount, procUmnt}:            true,
+	{progMount, versMount, procMntExport}:       true,
+	{progNFS, versNFS, procNull}:                true,
+	{progNFS, versNFS, procGetattr}:             true,
+	{progNFS, versNFS, procLookup}:              true,
+	{progNFS, versNFS, procAccess}:              true,
+	{progNFS, versNFS, procRead}:                true,
+	{progNFS, versNFS, procReaddirplus}:         true,
+	{progNFS, versNFS, procFsinfo}:              true,
 }
 
 func (c *rpcConn) fail(err error) {
+	if h := c.failHook; h != nil {
+		h()
+	}
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -331,8 +342,8 @@ func (c *rpcConn) buildCall(xid, prog, vers, proc uint32, args []byte) []byte {
 // call sends one request and waits for its reply. perCall bounds the wait.
 // It returns the procedure results (after the accepted-reply header).
 func (c *rpcConn) call(ctx context.Context, perCall time.Duration, prog, vers, proc uint32, args []byte) ([]byte, error) {
-	if !allowedCalls[callKey{prog, proc}] {
-		return nil, fmt.Errorf("%w: program %d procedure %d is not on the allow-list", ErrReadOnly, prog, proc)
+	if !allowedCalls[callKey{prog, vers, proc}] {
+		return nil, fmt.Errorf("%w: program %d version %d procedure %d is not on the allow-list", ErrReadOnly, prog, vers, proc)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -359,25 +370,42 @@ func (c *rpcConn) call(ctx context.Context, perCall time.Duration, prog, vers, p
 		c.forget(xid)
 		return nil, ctx.Err()
 	}
+	if c.isClosed() {
+		// The connection was failed while this caller waited for the slot (a half-written record
+		// of the previous holder): nothing may be appended to that stream.
+		<-c.wsem
+		c.forget(xid)
+		return nil, c.connErr()
+	}
 	if perCall > 0 {
 		_ = c.nc.SetWriteDeadline(time.Now().Add(perCall))
 	} else {
 		_ = c.nc.SetWriteDeadline(time.Time{})
 	}
 	stop := c.abortWriteOnCancel(ctx)
-	_, werr := c.nc.Write(msg)
+	n, werr := c.nc.Write(msg)
 	stop()
-	<-c.wsem
 	if werr != nil {
 		c.forget(xid)
-		// A write that failed or was interrupted may have left half a record on the stream:
-		// the connection cannot be reused.
+		if n == 0 && ctx.Err() != nil && errors.Is(werr, os.ErrDeadlineExceeded) {
+			// This caller's own cancellation interrupted the Write before a single byte left: the
+			// stream is intact (there is no half record), so the connection is NOT failed. Failing
+			// it would abort every other call pipelined on it because one caller gave up.
+			<-c.wsem
+			return nil, ctx.Err()
+		}
+		// A write that failed after sending part of the record (or for a reason other than this
+		// caller's cancellation) may have left half a record on the stream: the connection cannot
+		// be reused. It is failed BEFORE the write slot is released, so that no other writer can
+		// append a record to a stream that is about to be closed.
 		c.fail(fmt.Errorf("%w: write: %v", ErrConnClosed, werr))
+		<-c.wsem
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
 		}
 		return nil, c.connErr()
 	}
+	<-c.wsem
 
 	var timer <-chan time.Time
 	if perCall > 0 {

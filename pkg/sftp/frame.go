@@ -1,10 +1,14 @@
 package sftp
 
 import (
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"strings"
+	"sync"
 )
 
 // Wire validation of the server's replies.
@@ -22,7 +26,7 @@ import (
 // is closed; the error is never retried (a hostile or broken server would answer the same way again).
 var ErrMalformedReply = errors.New("sftp: malformed reply from the server")
 
-// ErrDirTooLarge is returned when a directory listing delivers more entries than Config.MaxDirEntries.
+// ErrDirTooLarge is returned when ONE directory listing delivers more entries than Config.MaxDirEntries. Only that listing fails.
 var ErrDirTooLarge = errors.New("sftp: directory listing exceeds the entry limit")
 
 // SFTP v3 packet types a client may receive.
@@ -31,6 +35,8 @@ const (
 	fxpStatus        = 101
 	fxpHandle        = 102
 	fxpData          = 103
+	fxpClose         = 4
+	fxpReaddir       = 12
 	fxpName          = 104
 	fxpAttrs         = 105
 	fxpExtendedReply = 201
@@ -164,12 +170,12 @@ type frameReader struct {
 	buf     []byte
 	pos     int
 	err     error
-	onNames func(n int) error // listing limit; may be nil
-	onFault func(error)       // called once with the reason a frame was rejected
+	tr      *wireTracker // per-listing entry accounting; may be nil
+	onFault func(error)  // called once with the reason a frame was rejected
 }
 
-func newFrameReader(r io.Reader, onNames func(int) error, onFault func(error)) *frameReader {
-	return &frameReader{r: r, onNames: onNames, onFault: onFault}
+func newFrameReader(r io.Reader, tr *wireTracker, onFault func(error)) *frameReader {
+	return &frameReader{r: r, tr: tr, onFault: onFault}
 }
 
 func (f *frameReader) Read(p []byte) (int, error) {
@@ -222,13 +228,184 @@ func (f *frameReader) next() error {
 		return err
 	}
 	names, err := validateFrame(b[4], b[5:])
-	if err == nil && names > 0 && f.onNames != nil {
-		err = f.onNames(names)
-	}
 	if err != nil {
 		f.buf = b[:0]
 		return f.reject(err)
 	}
+	if f.tr != nil && (b[4] == fxpName || b[4] == fxpStatus) {
+		id := binary.BigEndian.Uint32(b[5:9]) // validated: both frame types start with the request id
+		if b[4] == fxpStatus {
+			f.tr.replied(id)
+		} else if f.tr.name(id, names) {
+			b = f.tr.limitStatus(id) // the listing is over its budget: this reply becomes a failure of THAT listing only
+		}
+	}
 	f.buf = b
 	return nil
+}
+
+// ---------------------------------------------------------------------------------------------------------
+// per-listing entry accounting
+
+// wireTracker counts the entries each directory listing receives. pkg/sftp issues one READDIR per page with a fresh request id and
+// the id comes back on the NAME reply, so the tracker watches the OUTGOING frames (trackedWriter) to learn which handle an id belongs
+// to and the incoming NAME frames (frameReader) to count against that handle. A listing is one handle: the budget starts at zero when
+// the handle is opened and ends with its CLOSE, so overlapping listings never share a budget and a REALPATH reply (also a NAME frame)
+// is never counted. A listing over the budget gets a STATUS failure instead of the NAME frame; the connection stays up.
+type wireTracker struct {
+	max    int    // 0 = unlimited
+	marker string // the message of the synthetic failure; random per connection so that a server cannot forge it
+
+	mu      sync.Mutex
+	readdir map[uint32]string // READDIR request id -> handle, until the reply
+	count   map[string]int    // handle -> entries delivered
+	over    map[string]bool
+
+	// outgoing stream parser (frames are written as header then payload, possibly in several Writes)
+	cur  []byte // bytes of the frame being collected
+	skip int    // bytes of an uninteresting frame still to skip
+}
+
+func newWireTracker(max int) *wireTracker {
+	var nonce [8]byte
+	_, _ = rand.Read(nonce[:])
+	return &wireTracker{
+		max:     max,
+		marker:  "sftp-client: listing exceeds the entry limit [" + hex.EncodeToString(nonce[:]) + "]",
+		readdir: map[uint32]string{},
+		count:   map[string]int{},
+		over:    map[string]bool{},
+	}
+}
+
+// outFrameCap bounds what is collected of one outgoing frame: READDIR and CLOSE carry a handle the server chose in a frame of at most
+// maxFrame bytes.
+const outFrameCap = maxFrame + 64
+
+// observe parses the stream of frames this client sends.
+func (t *wireTracker) observe(p []byte) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for len(p) > 0 {
+		if t.skip > 0 {
+			n := t.skip
+			if n > len(p) {
+				n = len(p)
+			}
+			t.skip -= n
+			p = p[n:]
+			continue
+		}
+		// collect the length and the type byte first
+		if len(t.cur) < 5 {
+			n := 5 - len(t.cur)
+			if n > len(p) {
+				n = len(p)
+			}
+			t.cur = append(t.cur, p[:n]...)
+			p = p[n:]
+			if len(t.cur) < 5 {
+				continue
+			}
+			flen := int(binary.BigEndian.Uint32(t.cur))
+			typ := t.cur[4]
+			if flen < 1 || flen > outFrameCap || (typ != fxpReaddir && typ != fxpClose) {
+				t.skip = flen - 1 // not interesting (or implausible: nothing to track)
+				if t.skip < 0 {
+					t.skip = 0
+				}
+				t.cur = t.cur[:0]
+				continue
+			}
+		}
+		need := 4 + int(binary.BigEndian.Uint32(t.cur)) - len(t.cur)
+		n := need
+		if n > len(p) {
+			n = len(p)
+		}
+		t.cur = append(t.cur, p[:n]...)
+		p = p[n:]
+		if n == need {
+			t.frame(t.cur[4], t.cur[5:])
+			t.cur = t.cur[:0]
+		}
+	}
+}
+
+// frame handles one complete READDIR or CLOSE request body (after the type byte): id, handle string.
+func (t *wireTracker) frame(typ byte, body []byte) {
+	if len(body) < 8 {
+		return
+	}
+	id := binary.BigEndian.Uint32(body)
+	hl := binary.BigEndian.Uint32(body[4:])
+	if uint64(hl) > uint64(len(body)-8) {
+		return
+	}
+	h := string(body[8 : 8+hl])
+	switch typ {
+	case fxpReaddir:
+		t.readdir[id] = h
+	case fxpClose:
+		delete(t.count, h)
+		delete(t.over, h)
+	}
+}
+
+// replied forgets the request id of a STATUS reply (a READDIR ends with EOF or an error STATUS).
+func (t *wireTracker) replied(id uint32) {
+	t.mu.Lock()
+	delete(t.readdir, id)
+	t.mu.Unlock()
+}
+
+// name counts n entries of the NAME reply to request id against the handle of that READDIR and reports whether the listing is
+// over its budget (the reply must then be replaced). A NAME reply of any other request is not a listing page and is not counted.
+func (t *wireTracker) name(id uint32, n int) (over bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	h, ok := t.readdir[id]
+	if !ok {
+		return false
+	}
+	delete(t.readdir, id)
+	if t.max <= 0 {
+		return false
+	}
+	if t.over[h] {
+		return true
+	}
+	t.count[h] += n
+	if t.count[h] > t.max {
+		t.over[h] = true
+		return true
+	}
+	return false
+}
+
+// limitStatus builds the frame that replaces an over-budget NAME reply: STATUS SSH_FX_FAILURE (4) carrying the marker.
+func (t *wireTracker) limitStatus(id uint32) []byte {
+	body := []byte{fxpStatus}
+	body = binary.BigEndian.AppendUint32(body, id)
+	body = binary.BigEndian.AppendUint32(body, 4)
+	body = binary.BigEndian.AppendUint32(body, uint32(len(t.marker)))
+	body = append(body, t.marker...)
+	body = binary.BigEndian.AppendUint32(body, 0) // empty language tag
+	return append(binary.BigEndian.AppendUint32(nil, uint32(len(body))), body...)
+}
+
+// isLimitError reports whether err is the synthetic failure of this connection.
+func (t *wireTracker) isLimitError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), t.marker)
+}
+
+// trackedWriter feeds every byte pkg/sftp sends to the tracker before it goes on the wire.
+type trackedWriter struct {
+	io.WriteCloser
+	tr *wireTracker
+}
+
+func (w *trackedWriter) Write(p []byte) (int, error) {
+	w.tr.observe(p)
+	return w.WriteCloser.Write(p)
 }

@@ -18,6 +18,7 @@ package ftp
 import (
 	"fmt"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -217,4 +218,20 @@ func classify550(msg string) kind550 {
 		}
 	}
 	return k550Unknown
+}
+
+// mlstNameMatches says whether the pathname an MLST entry carries can be the answer to MLST remote: the last component
+// must agree (case-insensitive: a case-folding server may report the stored spelling). The server's directory part is
+// not compared (chroots and virtual roots differ), and an entry that names a directory itself ("", ".", "/") has
+// nothing to compare. A reply for ANOTHER file (the answer to an earlier command, one behind) fails this (WF24 G1(c)).
+func mlstNameMatches(serverName, remote string) bool {
+	sn := strings.TrimRight(serverName, "/")
+	base := sn
+	if i := strings.LastIndexByte(sn, '/'); i >= 0 {
+		base = sn[i+1:]
+	}
+	if base == "" || base == "." {
+		return true
+	}
+	return strings.EqualFold(base, path.Base(remote))
 }

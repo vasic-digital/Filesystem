@@ -51,8 +51,9 @@ func (p *ftpPeer) log(s string) {
 	p.mu.Unlock()
 }
 
-// startFTPPeer answers: 220, AUTH TLS (when tlsOn), then a TLS handshake, then USER with 530 (so a login attempt
-// is visible and ends at once). In clear mode it answers 220 and USER with 530 directly.
+// startFTPPeer answers: 220, AUTH TLS (when tlsOn), then a TLS handshake, then USER with 331 and PASS with 530 (so a
+// login attempt is visible and ends at once; a USER-phase 530 would NOT be an authentication failure, WF24 G2). In clear
+// mode it answers 220 and the same USER/PASS pair directly.
 func startFTPPeer(t *testing.T, tlsOn bool) *ftpPeer {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -103,7 +104,9 @@ func startFTPPeer(t *testing.T, tlsOn bool) *ftpPeer {
 						}
 						out, in = tc, bufio.NewReader(tc)
 					case "USER":
-						_, _ = io.WriteString(out, "530 user rejected\r\n")
+						_, _ = io.WriteString(out, "331 password please\r\n")
+					case "PASS":
+						_, _ = io.WriteString(out, "530 Login incorrect\r\n")
 						return
 					default:
 						_, _ = io.WriteString(out, "502 no\r\n")

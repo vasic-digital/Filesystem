@@ -406,13 +406,13 @@ func TestDegradedList_ParsesLISTLines(t *testing.T) {
 		if err != nil {
 			return true, true
 		}
-		_, _ = io.WriteString(dc, "-rw-r--r-- 1 u g 10 May 17  2020 a.txt\r\nthis line is not a listing\r\n")
+		_, _ = io.WriteString(dc, "this line is not a listing\r\n-rw-r--r-- 1 u g 10 May 17  2020 a.txt\r\n")
 		_ = dc.Close()
 		ss.reply("226 done")
 		return true, true
 	})
 	_, err = c.ListDirectory(ctx5(t), "/")
-	require.ErrorIs(t, err, ErrListingIncomplete)
+	require.ErrorIs(t, err, ErrListingIncomplete, "a first line that is no listing line is a desynchronised channel (fix round 3: a garbage line AFTER an entry is a skipped fragment, see fix_r3_list_test.go)")
 }
 
 // ---- misc ---------------------------------------------------------------------------------------------------------------

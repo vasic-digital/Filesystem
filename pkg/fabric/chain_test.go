@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"digital.vasic.filesystem/pkg/client"
 	"digital.vasic.filesystem/pkg/decorators"
@@ -102,7 +104,7 @@ func TestChain_RealLocalFilesystem(t *testing.T) {
 // FuzzConfined: whatever the input, the inner client either is not called, or
 // receives an absolute, clean path inside the root with no ".." segment.
 func FuzzConfined(f *testing.F) {
-	for _, s := range []string{"", "/", "a", "../..", "/data/media/../../etc", "\\\\x\\y", "a\x00b", "a\r\nDELE /data/b", "a\x1b[2J", "a\x7f", "a\tb", "/data/media/./a//b/", "/data/media2", "..\\..\\z", "%2e%2e/x"} {
+	for _, s := range []string{"", "/", "a", "../..", "/data/media/../../etc", "\\\\x\\y", "a\x00b", "a\r\nDELE /data/b", "a\x1b[2J", "a\x7f", "a\tb", "/data/media/./a//b/", "/data/media2", "..\\..\\z", "%2e%2e/x", "a\u0085b", "a\u009b2J", "a\x85b", "a\x9b2J", "a\xff\xfeb", "/data/media/\u65e5\u672c"} {
 		f.Add(s)
 	}
 	const root = "/data/media"
@@ -128,8 +130,11 @@ func FuzzConfined(f *testing.F) {
 				continue
 			}
 			got := fc.paths(op.String())[0]
+			if !utf8.ValidString(got) {
+				t.Fatalf("%v(%q): inner saw invalid UTF-8 %q", op, p, got)
+			}
 			for _, r := range got {
-				if r < 0x20 || r == 0x7f {
+				if unicode.IsControl(r) { // round 3 (N6): C0, DEL and the C1 controls
 					t.Fatalf("%v(%q): inner saw a control character in %q", op, p, got)
 				}
 			}

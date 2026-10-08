@@ -29,6 +29,11 @@ func (h Hooks) read(n int) {
 // consumer that type-asserts io.ReaderAt / io.Seeker / io.WriterTo gets the
 // same answer it would get from the inner stream.
 func Wrap(rc io.ReadCloser, h Hooks) io.ReadCloser {
+	if IsNil(rc) {
+		// A nil (or typed-nil) stream stays nil: a non-nil wrapper around it
+		// would panic on Close and could never release what its caller holds.
+		return nil
+	}
 	_, ra := rc.(io.ReaderAt)
 	_, sk := rc.(io.Seeker)
 	_, wt := rc.(io.WriterTo)
@@ -91,9 +96,10 @@ func Wrap(rc io.ReadCloser, h Hooks) io.ReadCloser {
 }
 
 // WrapSeekable is Wrap for a stream that is a client.ReadSeekCloser; the
-// result is one too (the Seek capability is never lost).
+// result is one too (the Seek capability is never lost), and nil for a nil or
+// typed-nil stream.
 func WrapSeekable(rc client.ReadSeekCloser, h Hooks) client.ReadSeekCloser {
-	w, _ := Wrap(rc, h).(client.ReadSeekCloser)
+	w, _ := Wrap(rc, h).(client.ReadSeekCloser) // Wrap returns nil for a nil or typed-nil stream
 	return w
 }
 
@@ -136,10 +142,32 @@ type wtMix struct {
 	h  Hooks
 }
 
+// WriteTo reports the bytes AS THEY ARE WRITTEN (not once at the end), so an
+// idle-based lease sees a long WriteTo copy as the activity it is. Without an
+// OnRead hook the destination is passed through untouched, which keeps the
+// inner stream's own fast paths (sendfile, copy_file_range).
 func (m wtMix) WriteTo(w io.Writer) (int64, error) {
-	n, err := m.rc.(io.WriterTo).WriteTo(w)
-	if n > 0 {
-		m.h.read(int(n))
+	if m.h.OnRead == nil {
+		return m.rc.(io.WriterTo).WriteTo(w)
 	}
+	hw := &hookWriter{w: w, h: m.h}
+	n, err := m.rc.(io.WriterTo).WriteTo(hw)
+	if rest := n - hw.n; rest > 0 { // bytes the inner WriteTo reports but did not push through w
+		m.h.read(int(rest))
+	}
+	return n, err
+}
+
+// hookWriter forwards writes and reports each accepted byte count.
+type hookWriter struct {
+	w io.Writer
+	h Hooks
+	n int64
+}
+
+func (x *hookWriter) Write(p []byte) (int, error) {
+	n, err := x.w.Write(p)
+	x.n += int64(n)
+	x.h.read(n)
 	return n, err
 }

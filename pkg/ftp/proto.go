@@ -38,11 +38,30 @@ import (
 
 // Limits (Config.MaxReplyBytes, Config.MaxListEntries override them).
 const (
-	DefaultMaxReplyBytes  = 1 << 20 // one control reply, all its lines
-	DefaultMaxListEntries = 1 << 20 // lines of one MLSD/LIST listing
-	maxLineBytes          = 16 << 10
-	quitTimeout           = 2 * time.Second
+	DefaultMaxReplyBytes  = 1 << 20   // one control reply, all its lines
+	DefaultMaxListEntries = 1 << 20   // lines of one MLSD/LIST listing
+	DefaultMaxListBytes   = 256 << 20 // bytes of one MLSD/LIST listing (all its lines)
+	maxLineBytes          = 16 << 10  // one listing line
+	// controlLineBytes is the longest control-channel LINE: it must hold every line the listing can return (an MLST reply
+	// repeats such a line), otherwise an entry that was listed could not be stat'ed (WF24 G8).
+	controlLineBytes = 2 * maxLineBytes
+	quitTimeout      = 2 * time.Second
+	// drainWait is the zero-wait socket check before a command: data that is already in the kernel buffer is seen at once,
+	// the wait only covers a reply that is a few hundred microseconds behind. postTransferWait is the same check after the
+	// final reply of a complete transfer (a second reply there is the masked-451 case of WF24 K1.i).
+	drainWait = 250 * time.Microsecond
 )
+
+// postTransferWait: see drainWait. A variable only so that a test can widen the window (a loaded host makes a 2 ms window
+// a race).
+var postTransferWait = 2 * time.Millisecond
+
+// earlyCloseWait bounds the wait for the server's reply to a download the CALLER stopped reading (a Seek, an early
+// Close): measured against pure-ftpd, a download closed after a few bytes is sometimes never answered (30 s until the
+// IOTimeout, WF24 G5, trace in the round-3 evidence); the connection is then dropped and the next operation re-dials.
+// It also bounds the wait for the end of the data after the seeker read the announced SIZE. A variable only so that
+// tests can shorten it.
+var earlyCloseWait = 3 * time.Second
 
 // Errors of the protocol layer.
 var (
@@ -61,13 +80,40 @@ var (
 	ErrUTF8Refused = errors.New("ftp: the server refused OPTS UTF8 ON and sent a name that is not valid UTF-8, so non-ASCII names would be garbled")
 	// ErrProtocol marks a violation of the command/reply discipline; the connection is dropped.
 	ErrProtocol = errors.New("ftp: protocol violation")
+	// ErrTLSNotOffered is the leaf of an AUTH TLS refusal: clear text is never used as a fallback.
+	ErrTLSNotOffered = errors.New("ftp: the server does not offer explicit TLS; clear text is never used as a fallback")
 )
 
+// Leaf sentinels of the connect phases. fabric.Classify scans the text of every LEAF error for credential-failure
+// markers BEFORE it honours the phase class, so a server's wording ("Access denied: too many connections") must never
+// sit in a leaf: the server text is carried by a wrapper message, the leaf is one of these marker-free sentinels
+// (WF24 G2, class K2).
+var (
+	errPhaseTransient = errors.New("ftp: the server answered a connect-phase command with a temporary refusal")
+	errPhaseRefused   = errors.New("ftp: the server refused a connect-phase command")
+	errUserRefused    = errors.New("ftp: the server refused the user name before any password was sent")
+	errPassRejected   = errors.New("ftp: the server rejected the password step with a reply that is not a credential verdict")
+	errPassUnknown    = errors.New("ftp: the outcome of the password step is unknown")
+)
+
+// listViolation is protoViolation for a reply whose SHAPE is wrong (an MLST with no entry or several); it also is an
+// ErrListingIncomplete, which is how callers and tests recognise an unusable listing reply.
+func listViolation(format string, a ...any) error {
+	return fabric.MarkTransient(fmt.Errorf("%w: %w: "+format, append([]any{ErrProtocol, ErrListingIncomplete}, a...)...))
+}
+
+// protoViolation builds a lock-step violation: ErrProtocol, transient. The connection is already dropped when this is
+// returned, so a retry (Retrying on the scan path) runs on a fresh connection that is in step again (WF24 G11).
+func protoViolation(format string, a ...any) error {
+	return fabric.MarkTransient(fmt.Errorf("%w: "+format, append([]any{ErrProtocol}, a...)...))
+}
+
 type protoOpts struct {
-	dialTimeout time.Duration
-	ioTimeout   time.Duration
-	maxReply    int
-	disableEPSV bool
+	dialTimeout  time.Duration
+	ioTimeout    time.Duration
+	maxReply     int
+	disableEPSV  bool
+	loginBackoff time.Duration // 0 selects DefaultLoginBackoff, negative disables the back-off
 }
 
 // proto is one FTP control connection plus at most one data connection.
@@ -81,9 +127,14 @@ type proto struct {
 	remoteIP string
 	feats    map[string]string
 	skipEPSV bool
-	// utf8Refused: FEAT listed UTF8 but the server answered OPTS UTF8 ON with a refusal. Connect still succeeds (a
-	// server that is always UTF-8 says no to a switch it does not need); listings check the names they return.
-	utf8Refused bool
+	// utf8On: OPTS UTF8 ON was accepted, so names are UTF-8 by agreement. When it is false (the server did not list UTF8,
+	// or refused the switch - pure-ftpd answers 504) connect still succeeds, and listings check the names they return
+	// (WF24 G9: not only after a refusal).
+	utf8On bool
+	// passWritten: the PASS command has been written on this connection (the password may have been seen and counted).
+	passWritten bool
+	// loginKey identifies host:port + user for the login back-off (set by connect).
+	loginKey string
 
 	aborted atomic.Bool
 
@@ -94,19 +145,28 @@ type proto struct {
 	data     *dconn
 }
 
+// dialTCP opens the control connection; a variable only so that a test can make the dial slow.
+var dialTCP = func(ctx context.Context, d *net.Dialer, addr string) (net.Conn, error) {
+	return d.DialContext(ctx, "tcp", addr)
+}
+
 func dialProto(ctx context.Context, host string, port int, o protoOpts, tlsCfg *tls.Config) (*proto, error) {
+	// ONE budget for the whole connect: it starts BEFORE the TCP dial, so the dial and the phases after it share
+	// DialTimeout (WF24 G12: it used to start after the dial, so the worst case was twice DialTimeout).
+	var phaseEnd time.Time
+	if o.dialTimeout > 0 {
+		phaseEnd = time.Now().Add(o.dialTimeout)
+	}
 	d := net.Dialer{Timeout: o.dialTimeout}
-	raw, err := d.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(port)))
+	raw, err := dialTCP(ctx, &d, net.JoinHostPort(host, strconv.Itoa(port)))
 	if err != nil {
 		return nil, err
 	}
-	p := &proto{o: o, raw: raw, ctl: raw, br: bufio.NewReaderSize(raw, 4096), tlsCfg: tlsCfg, feats: map[string]string{}, remoteIP: host}
+	p := &proto{o: o, raw: raw, ctl: raw, br: bufio.NewReaderSize(raw, controlLineBytes), tlsCfg: tlsCfg, feats: map[string]string{}, remoteIP: host}
 	if ta, ok := raw.RemoteAddr().(*net.TCPAddr); ok {
 		p.remoteIP = ta.IP.String()
 	}
-	if o.dialTimeout > 0 {
-		p.phaseEnd = time.Now().Add(o.dialTimeout)
-	}
+	p.phaseEnd = phaseEnd
 	return p, nil
 }
 
@@ -133,7 +193,12 @@ func (p *proto) deadline(ctx context.Context) time.Time { return p.deadlineFrom(
 
 // deadlineFrom is the deadline of an I/O whose IOTimeout budget started at start (a whole control reply shares one budget).
 func (p *proto) deadlineFrom(ctx context.Context, start time.Time) time.Time {
-	d := start.Add(p.o.ioTimeout)
+	return p.deadlineFor(ctx, start, p.o.ioTimeout)
+}
+
+// deadlineFor is deadlineFrom with an explicit budget (an early-closed download waits less than a full IOTimeout).
+func (p *proto) deadlineFor(ctx context.Context, start time.Time, budget time.Duration) time.Time {
+	d := start.Add(budget)
 	if cd, ok := ctx.Deadline(); ok && cd.Before(d) {
 		d = cd
 	}
@@ -238,6 +303,11 @@ func (p *proto) readLine() (string, error) {
 
 // readReply reads one complete reply (RFC 959 multi-line included) with its size bound. It does not judge the code.
 func (p *proto) readReply(ctx context.Context) (int, []string, error) {
+	return p.readReplyBudget(ctx, p.o.ioTimeout)
+}
+
+// readReplyBudget is readReply with an explicit time budget for the whole reply.
+func (p *proto) readReplyBudget(ctx context.Context, budget time.Duration) (int, []string, error) {
 	var (
 		lines []string
 		total int
@@ -246,7 +316,7 @@ func (p *proto) readReply(ctx context.Context) (int, []string, error) {
 	)
 	start := time.Now() // the whole reply, all its lines, gets ONE IOTimeout budget (a server dripping one byte a minute is not "alive")
 	for first := true; ; first = false {
-		_ = p.ctl.SetReadDeadline(p.deadlineFrom(ctx, start))
+		_ = p.ctl.SetReadDeadline(p.deadlineFor(ctx, start, budget))
 		if p.aborted.Load() {
 			return 0, nil, ErrAborted
 		}
@@ -318,7 +388,7 @@ func (p *proto) judge(ctx context.Context, verb string, code int, lines []string
 		return code, lines, nil
 	default:
 		p.markBroken()
-		return code, lines, fmt.Errorf("%w: reply %d to %s", ErrProtocol, code, verb)
+		return code, lines, protoViolation("reply %d to %s", code, verb)
 	}
 }
 
@@ -346,16 +416,52 @@ func (p *proto) fail(ctx context.Context, err error) error {
 
 // reply reads and judges the next reply without sending anything.
 func (p *proto) reply(ctx context.Context, verb string, expect []int) (int, []string, error) {
+	return p.replyBudget(ctx, verb, expect, p.o.ioTimeout)
+}
+
+// replyBudget is reply with an explicit time budget for the whole reply.
+func (p *proto) replyBudget(ctx context.Context, verb string, expect []int, budget time.Duration) (int, []string, error) {
 	stop := context.AfterFunc(ctx, p.interrupt)
 	defer stop()
 	if p.isBroken() {
 		return 0, nil, p.fail(ctx, io.ErrClosedPipe)
 	}
-	code, lines, err := p.readReply(ctx)
+	code, lines, err := p.readReplyBudget(ctx, budget)
 	if err != nil {
 		return 0, nil, p.fail(ctx, err)
 	}
 	return p.judge(ctx, verb, code, lines, expect)
+}
+
+// drain proves that nothing is waiting on the control channel: no byte in the read buffer and none arriving within
+// wait. Anything there is a reply nobody asked for (the connection is dropped, ErrProtocol, transient); a peer that
+// closed the connection while idle is reported as the I/O failure it is. The check arms a short read deadline, so an
+// abort (interrupt) that happens meanwhile is re-checked and never undone.
+func (p *proto) drain(ctx context.Context, what string, wait time.Duration) error {
+	if p.br.Buffered() > 0 {
+		p.markBroken()
+		return protoViolation("unsolicited data %s", what)
+	}
+	_ = p.ctl.SetReadDeadline(time.Now().Add(wait))
+	if p.aborted.Load() {
+		return p.fail(ctx, ErrAborted)
+	}
+	_, err := p.br.Peek(1)
+	if p.aborted.Load() {
+		return p.fail(ctx, ErrAborted)
+	}
+	if err == nil {
+		p.markBroken()
+		return protoViolation("unsolicited data %s", what)
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return nil // nothing waiting: in step
+	}
+	if errors.Is(err, io.EOF) {
+		err = io.ErrUnexpectedEOF
+	}
+	return p.fail(ctx, err)
 }
 
 // cmd sends one command and reads its reply. expect lists the accepted positive codes (nil accepts any 1yz-3yz).
@@ -371,10 +477,10 @@ func (p *proto) cmd(ctx context.Context, expect []int, format string, a ...any) 
 	if p.isBroken() {
 		return 0, nil, p.fail(ctx, io.ErrClosedPipe)
 	}
-	if p.br.Buffered() > 0 {
-		// bytes nobody asked for (an extra reply of an earlier command): everything after them is out of step
-		p.markBroken()
-		return 0, nil, fmt.Errorf("%w: unsolicited data before %s", ErrProtocol, verb)
+	// bytes nobody asked for (an extra reply of an earlier command) in the buffer OR still in the kernel socket buffer:
+	// everything after them is out of step (WF24 G1(a): the bufio check alone cannot see a reply that is still in flight)
+	if err := p.drain(ctx, "before "+verb, drainWait); err != nil {
+		return 0, nil, err
 	}
 	_ = p.ctl.SetWriteDeadline(p.deadline(ctx))
 	if p.aborted.Load() {
@@ -382,6 +488,11 @@ func (p *proto) cmd(ctx context.Context, expect []int, format string, a ...any) 
 	}
 	if _, err := p.ctl.Write([]byte(escapeIAC(line) + "\r\n")); err != nil {
 		return 0, nil, p.fail(ctx, err)
+	}
+	if verb == "PASS" {
+		p.mu.Lock()
+		p.passWritten = true
+		p.mu.Unlock()
 	}
 	code, lines, err := p.readReply(ctx)
 	if err != nil {
@@ -405,9 +516,9 @@ func (p *proto) stepErr(ctx context.Context, phase string, err error) error {
 	var te *textproto.Error
 	if errors.As(err, &te) {
 		if te.Code/100 == 4 {
-			return fabric.MarkTransient(fmt.Errorf("ftp: %s: %d %s", phase, te.Code, flat(te.Msg)))
+			return fabric.MarkTransient(fmt.Errorf("ftp: %s: %d %s: %w", phase, te.Code, flat(te.Msg), errPhaseTransient))
 		}
-		return fmt.Errorf("ftp: %s refused by the server: %d %s", phase, te.Code, flat(te.Msg))
+		return fmt.Errorf("ftp: %s refused by the server: %d %s: %w", phase, te.Code, flat(te.Msg), errPhaseRefused)
 	}
 	if errors.Is(err, ErrProtocol) || errors.Is(err, ErrReplyTooLarge) || errors.Is(err, ErrAborted) {
 		return fmt.Errorf("ftp: %s: %w", phase, err)
@@ -430,7 +541,7 @@ func (p *proto) authTLS(ctx context.Context) error {
 	if err != nil {
 		var te *textproto.Error
 		if errors.As(err, &te) && te.Code/100 == 5 {
-			return fmt.Errorf("ftp: server does not offer explicit TLS (AUTH TLS: %d %s); clear text is never used as a fallback", te.Code, flat(te.Msg))
+			return fmt.Errorf("ftp: AUTH TLS refused: %d %s: %w", te.Code, flat(te.Msg), ErrTLSNotOffered)
 		}
 		return p.stepErr(ctx, "AUTH TLS", err)
 	}
@@ -449,7 +560,7 @@ func (p *proto) startTLS(ctx context.Context) error {
 	p.mu.Lock()
 	p.ctl = tc
 	p.mu.Unlock()
-	p.br = bufio.NewReaderSize(tc, 4096)
+	p.br = bufio.NewReaderSize(tc, controlLineBytes)
 	_ = tc.SetDeadline(p.deadline(ctx))
 	if err := tc.HandshakeContext(ctx); err != nil {
 		p.markBroken()
@@ -460,20 +571,23 @@ func (p *proto) startTLS(ctx context.Context) error {
 
 // login authenticates and prepares the session. Classification by phase:
 //
-//	USER      421 and other 4yz transient; 530 (and 332/532) authentication; other 5yz permanent
+//	USER      421 and other 4yz transient; 530/332/532 and other 5yz permanent - NEVER authentication: no password was sent,
+//	          so a USER-phase refusal ("too many connections", "user not allowed") cannot be a lockout and must not latch the
+//	          pool (WF24 G2); the server's text is carried by a wrapper, never by the leaf Classify scans
 //	PASS      530/430/534/535/332/532 authentication; ANYTHING else, including a connection lost before the reply, is
-//	          permanent and is never retried (a retry would send the password again: lockout risk)
+//	          permanent, is never retried, and starts the login back-off (a retry would send the password again: lockout
+//	          risk; the back-off covers every client of the process, WF24 G3)
 //	FEAT      a refusal means "no features"; I/O failures are transient
 //	TYPE, OPTS UTF8, PBSZ, PROT   a refusal is a permanent configuration failure, never an authentication failure
 func (p *proto) login(ctx context.Context, user, pass string, disableMLSD bool) error {
 	code, _, err := p.cmd(ctx, []int{230, 331}, "USER %s", user)
 	if err != nil {
-		return p.userErr(ctx, err)
+		return p.userErr(ctx, code, err)
 	}
 	if code == 331 {
-		_, _, err = p.cmd(ctx, []int{230, 202}, "PASS %s", pass)
+		code, _, err = p.cmd(ctx, []int{230, 202}, "PASS %s", pass)
 		if err != nil {
-			return p.passErr(ctx, user, err)
+			return p.passErr(ctx, user, code, err)
 		}
 	}
 	// FEAT is advisory: its refusal is not an error
@@ -505,7 +619,9 @@ func (p *proto) login(ctx context.Context, user, pass string, disableMLSD bool) 
 			if !errors.As(err, &te) || te.Code/100 == 4 {
 				return p.stepErr(ctx, "OPTS UTF8 ON", err)
 			}
-			p.utf8Refused = true // 5yz: the server will not switch; see utf8Refused
+			// 5yz: the server will not switch (pure-ftpd answers 504); names stay checked, see utf8On
+		} else {
+			p.utf8On = true
 		}
 	}
 	if p.tlsCfg != nil {
@@ -520,17 +636,39 @@ func (p *proto) login(ctx context.Context, user, pass string, disableMLSD bool) 
 	return nil
 }
 
-func (p *proto) userErr(ctx context.Context, err error) error {
+func (p *proto) userErr(ctx context.Context, code int, err error) error {
+	if code == 332 && errors.Is(err, ErrProtocol) {
+		// "need account" is a 3yz reply the lock-step does not expect at USER (it also dropped the connection): the
+		// account step (ACCT) is not supported, which is a configuration refusal, not a transient fault
+		return fmt.Errorf("ftp: login refused at USER (no password was sent): 332 the server wants an account (ACCT is not supported): %w", errUserRefused)
+	}
 	var te *textproto.Error
 	if errors.As(err, &te) && (te.Code == 530 || te.Code == 532 || te.Code == 332) {
-		return fabric.MarkAuth(fmt.Errorf("ftp: login refused at USER: %d %s", te.Code, flat(te.Msg)))
+		// no password was sent: this cannot be a lockout and must not latch the pool root (WF24 G2). The server's text
+		// is in the wrapper, the leaf is marker-free, so fabric.Classify cannot read it as a credential failure.
+		return fmt.Errorf("ftp: login refused at USER (no password was sent): %d %s: %w", te.Code, flat(te.Msg), errUserRefused)
 	}
 	return p.stepErr(ctx, "USER", err)
 }
 
-func (p *proto) passErr(ctx context.Context, user string, err error) error {
+// passErr classifies a failure of the PASS step. A definite credential verdict (530, 430, 534, 535, 332, 532) is
+// authentication (never retried; the pool latches the root). Everything else - no reply, a reply that is not a
+// credential verdict, the context ending after the password was written - is AMBIGUOUS: the server may have counted
+// an attempt, so the failure is permanent AND the login back-off is started, which refuses the next login of this
+// host and user from ANY client of the process before a password is sent again (WF24 G3).
+func (p *proto) passErr(ctx context.Context, user string, code int, err error) error {
+	p.mu.Lock()
+	written := p.passWritten
+	p.mu.Unlock()
 	if ce := ctx.Err(); ce != nil {
+		if written {
+			noteAmbiguousLogin(p.loginKey, p.o.loginBackoff)
+		}
 		return fmt.Errorf("ftp: login: %w", ce)
+	}
+	if code == 332 && errors.Is(err, ErrProtocol) {
+		// "need account" at PASS: the credentials are not enough (a verdict about the credentials, not an unknown outcome)
+		return fabric.MarkAuth(fmt.Errorf("ftp: login as %q failed: 332 the server wants an account (ACCT is not supported)", user))
 	}
 	var te *textproto.Error
 	if errors.As(err, &te) {
@@ -538,11 +676,15 @@ func (p *proto) passErr(ctx context.Context, user string, err error) error {
 		case 530, 430, 534, 535, 332, 532:
 			return fabric.MarkAuth(fmt.Errorf("ftp: login as %q failed: %d %s", user, te.Code, flat(te.Msg)))
 		}
-		return fmt.Errorf("ftp: PASS rejected: %d %s (not retried: a retry would send the password again)", te.Code, flat(te.Msg))
+		noteAmbiguousLogin(p.loginKey, p.o.loginBackoff)
+		return fmt.Errorf("ftp: PASS rejected: %d %s (not retried: a retry would send the password again): %w", te.Code, flat(te.Msg), errPassRejected)
 	}
 	// no reply to PASS (or an unexpected one): not retryable, and deliberately not wrapped (a wrapped network error is
 	// classified transient by fabric.Classify)
-	return fmt.Errorf("ftp: connection failed after the password was sent (%v); not retried, a retry would send it again", err)
+	if written {
+		noteAmbiguousLogin(p.loginKey, p.o.loginBackoff)
+	}
+	return fmt.Errorf("ftp: connection failed after the password was sent (%v); not retried, a retry would send it again: %w", err, errPassUnknown)
 }
 
 // ---------------------------------------------------------------------------------------------------------
@@ -556,6 +698,9 @@ type dconn struct {
 	tls     bool
 	aborted atomic.Bool
 	once    sync.Once
+	// maxWait, when > 0, caps the wait of every read (nanoseconds): the seeker reads the end of a transfer with it, so a
+	// server that does not close the data connection after the announced SIZE does not cost a whole IOTimeout.
+	maxWait atomic.Int64
 }
 
 func (d *dconn) abortNow() {
@@ -574,7 +719,13 @@ func (d *dconn) Read(b []byte) (int, error) {
 	if d.aborted.Load() {
 		return 0, d.abortErr()
 	}
-	_ = d.Conn.SetReadDeadline(d.p.deadline(d.ctx))
+	dl := d.p.deadline(d.ctx)
+	if w := d.maxWait.Load(); w > 0 {
+		if e := time.Now().Add(time.Duration(w)); e.Before(dl) {
+			dl = e
+		}
+	}
+	_ = d.Conn.SetReadDeadline(dl)
 	if d.aborted.Load() { // abort between the first check and arming: arming must not undo it
 		return 0, d.abortErr()
 	}
@@ -623,7 +774,20 @@ func (d *dconn) Close() error {
 	return err
 }
 
+// parseEPSV reads the port of a 229 reply. RFC 2428: "(<d><d><d><port><d>)" where <d> is ANY printable delimiter
+// character (33..126), usually "|"; a reply without parentheses is read the lenient way (the first "|||").
 func parseEPSV(line string) (int, bool) {
+	if i, j := strings.Index(line, "("), strings.LastIndex(line, ")"); i >= 0 && j > i+4 {
+		in := line[i+1 : j]
+		d := in[0]
+		if d >= 33 && d <= 126 && d != '(' && d != ')' && len(in) >= 5 && in[1] == d && in[2] == d && in[len(in)-1] == d {
+			n, err := strconv.Atoi(in[3 : len(in)-1])
+			if err == nil && n > 0 && n < 65536 {
+				return n, true
+			}
+			return 0, false
+		}
+	}
 	start := strings.Index(line, "|||")
 	end := strings.LastIndex(line, "|")
 	if start < 0 || start+3 >= end {
@@ -658,10 +822,12 @@ func (p *proto) passivePort(ctx context.Context) (int, error) {
 				return port, nil
 			}
 		}
+		if err == nil {
+			// a 229 whose text holds no port is a reply we cannot read: the lock-step is in doubt (WF24 K1.g)
+			p.markBroken()
+			return 0, protoViolation("unusable EPSV reply")
+		}
 		if p.isBroken() {
-			if err == nil {
-				err = fmt.Errorf("%w: unusable EPSV reply", ErrProtocol)
-			}
 			return 0, err
 		}
 		p.skipEPSV = true
@@ -673,7 +839,7 @@ func (p *proto) passivePort(ctx context.Context) (int, error) {
 	port, ok := parsePASV(strings.Join(lines, " "))
 	if !ok {
 		p.markBroken()
-		return 0, fmt.Errorf("%w: unusable PASV reply", ErrProtocol)
+		return 0, protoViolation("unusable PASV reply")
 	}
 	return port, nil
 }
@@ -738,12 +904,20 @@ func (p *proto) finishTransfer(ctx context.Context, dc *dconn, complete bool) er
 		return nil
 	}
 	if complete {
-		_, _, err := p.reply(ctx, "transfer", []int{226, 250})
-		return err
+		if _, _, err := p.reply(ctx, "transfer", []int{226, 250}); err != nil {
+			return err
+		}
+		return p.trailing(ctx)
 	}
 	// Early close: the first reply may be 226/250 (the transfer had finished), 426/451/450 (aborted) or, measured
 	// against pure-ftpd over TLS, "150 <statistics>"; the lock-step check below is what proves nothing else follows.
-	_, _, err := p.reply(ctx, "transfer", nil)
+	// The wait is bounded by earlyCloseWait: pure-ftpd sometimes never answers a download closed after a few bytes
+	// (WF24 G5: 30 s until the IOTimeout, measured in the round-3 trace); the connection is then dropped, not waited for.
+	wait := p.o.ioTimeout
+	if wait > earlyCloseWait {
+		wait = earlyCloseWait
+	}
+	_, _, err := p.replyBudget(ctx, "transfer", nil, wait)
 	var te *textproto.Error
 	if err != nil && !errors.As(err, &te) {
 		return nil // broken is recorded; the caller already stopped reading
@@ -754,16 +928,43 @@ func (p *proto) finishTransfer(ctx context.Context, dc *dconn, complete bool) er
 	return nil
 }
 
+// trailing looks for a second reply right behind the final reply of a COMPLETE transfer (an extra 226 of an earlier
+// transfer that was taken for this one's final reply would mask the real, possibly negative, one). A second reply drops
+// the connection; when it is itself negative it is the transfer's real verdict and is returned. Best effort: a reply
+// more than postTransferWait behind is caught by the drain check of the next command.
+func (p *proto) trailing(ctx context.Context) error {
+	if p.isBroken() {
+		return nil
+	}
+	if p.br.Buffered() == 0 {
+		_ = p.ctl.SetReadDeadline(time.Now().Add(postTransferWait))
+		if p.aborted.Load() {
+			return nil
+		}
+		if _, err := p.br.Peek(1); err != nil {
+			return nil // nothing there (timeout), or the peer closed: the next command finds out
+		}
+	}
+	p.markBroken()
+	tctx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	code, lines, err := p.readReplyBudget(tctx, time.Second)
+	if err == nil && code >= 400 {
+		return &textproto.Error{Code: code, Msg: strings.Join(lines, "\n")}
+	}
+	return nil
+}
+
 // list runs a listing command (MLSD or LIST) and feeds every line to onLine. A line onLine rejects does not stop the
 // transfer (it is read to its end so that the connection stays in step); the first such error is returned at the end.
-func (p *proto) list(ctx context.Context, maxEntries int, onLine func(string) error, format string, a ...any) error {
+func (p *proto) list(ctx context.Context, maxEntries, maxBytes int, onLine func(string) error, format string, a ...any) error {
 	dc, err := p.beginTransfer(ctx, 0, format, a...)
 	if err != nil {
 		return err
 	}
 	br := bufio.NewReaderSize(dc, maxLineBytes)
 	var first error
-	n := 0
+	n, total := 0, 0
 	for {
 		b, rerr := br.ReadSlice('\n')
 		if errors.Is(rerr, bufio.ErrBufferFull) {
@@ -774,7 +975,8 @@ func (p *proto) list(ctx context.Context, maxEntries int, onLine func(string) er
 		if len(b) > 0 {
 			line := strings.TrimSuffix(strings.TrimSuffix(string(b), "\n"), "\r")
 			n++
-			if n > maxEntries {
+			total += len(b)
+			if n > maxEntries || total > maxBytes {
 				p.markBroken()
 				_ = dc.Close()
 				return ErrListingTooLarge
@@ -809,7 +1011,8 @@ func (p *proto) pwd(ctx context.Context) (string, error) {
 	s := strings.Join(lines, "\n")
 	i := strings.IndexByte(s, '"')
 	if i < 0 {
-		return "", fmt.Errorf("ftp: unsupported PWD reply %q", flat(s))
+		p.markBroken()
+		return "", protoViolation("unsupported PWD reply %q", flat(s))
 	}
 	var b strings.Builder
 	for j := i + 1; j < len(s); j++ {
@@ -823,7 +1026,8 @@ func (p *proto) pwd(ctx context.Context) (string, error) {
 		}
 		b.WriteByte(s[j])
 	}
-	return "", fmt.Errorf("ftp: unsupported PWD reply %q", flat(s))
+	p.markBroken()
+	return "", protoViolation("unsupported PWD reply %q", flat(s))
 }
 
 func (p *proto) mlstOK() bool { _, ok := p.feats["MLST"]; return ok }

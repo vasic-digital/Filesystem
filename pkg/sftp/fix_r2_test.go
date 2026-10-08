@@ -29,11 +29,9 @@ import (
 
 const (
 	fxpOpen     = 3
-	fxpClose    = 4
 	fxpRead     = 5
 	fxpFstat    = 8
 	fxpOpendir  = 11
-	fxpReaddir  = 12
 	fxpRealpath = 16
 	fxpStat     = 17
 )

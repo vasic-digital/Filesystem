@@ -82,10 +82,10 @@ func (r *readOnly) TestConnection(ctx context.Context) error {
 }
 func (r *readOnly) ReadFile(ctx context.Context, path string) (io.ReadCloser, error) {
 	rc, err := r.in.ReadFile(ctx, path)
-	if err != nil || rc == nil {
+	if err != nil {
 		return rc, err
 	}
-	return guard.Wrap(rc, guard.Hooks{}), nil
+	return guard.Wrap(rc, guard.Hooks{}), nil // a nil or typed-nil stream stays nil (guard.Wrap)
 }
 func (r *readOnly) GetFileInfo(ctx context.Context, path string) (*client.FileInfo, error) {
 	return r.in.GetFileInfo(ctx, path)
@@ -103,10 +103,10 @@ func (r *readOnly) GetProtocol() string { return r.in.GetProtocol() }
 func (r *readOnly) GetConfig() interface{} { return guard.RedactConfig(r.in.GetConfig()) }
 func (r *readOnlySeekable) OpenSeekable(ctx context.Context, path string) (client.ReadSeekCloser, error) {
 	rc, err := r.seek.OpenSeekable(ctx, path)
-	if err != nil || rc == nil {
+	if err != nil {
 		return rc, err
 	}
-	return guard.WrapSeekable(rc, guard.Hooks{}), nil
+	return guard.WrapSeekable(rc, guard.Hooks{}), nil // a nil or typed-nil stream stays nil
 }
 
 // --- mutations: refused, inner never called, data reader never consumed ---

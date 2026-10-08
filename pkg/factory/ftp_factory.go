@@ -62,7 +62,7 @@ func (f *DefaultFactory) createFTPClient(config *client.StorageConfig) (client.C
 		TrustedLAN:        trusted,
 		AllowDegradedList: degraded,
 		DisableEPSV:       noEPSV,
-		PinStore:          ftp.DefaultPinStore,
+		PinStore:          ftp.DeferredDefaultPinStore,
 	}, ftp.ScanOptions{})
 }
 

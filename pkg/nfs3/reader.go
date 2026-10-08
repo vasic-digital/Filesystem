@@ -63,9 +63,10 @@ type chunkResult struct {
 }
 
 type future struct {
-	off   int64
-	count uint32
-	ch    chan chunkResult
+	off    int64
+	count  uint32
+	ch     chan chunkResult
+	cancel context.CancelFunc // ends this READ only; the reader's own context ends all of them
 }
 
 // fileReader is a sequential, adaptive read-ahead, seekable reader over NFS READ.
@@ -164,9 +165,11 @@ func (r *fileReader) end() int64 {
 
 // issue starts one READ and returns its future.
 func (r *fileReader) issue(off int64, count uint32) *future {
-	f := &future{off: off, count: count, ch: make(chan chunkResult, 1)}
+	fctx, cancel := context.WithCancel(r.ctx)
+	f := &future{off: off, count: count, ch: make(chan chunkResult, 1), cancel: cancel}
 	go func() {
-		res, err := r.c.callNFS(r.ctx, procRead, encodeRead(r.fh, uint64(f.off), f.count), "READ")
+		defer cancel()
+		res, err := r.c.callNFS(fctx, procRead, encodeRead(r.fh, uint64(f.off), f.count), "READ")
 		if err != nil {
 			f.ch <- chunkResult{err: err}
 			return
@@ -189,8 +192,28 @@ func (r *fileReader) topUp() {
 	}
 }
 
+// dropQueue discards the read-ahead and CANCELS the READs still in flight: their results can never
+// be used (a Seek, an error or the end of the file made them stale), so they must not keep working
+// against the server.
+func (r *fileReader) dropQueue() {
+	for _, f := range r.q {
+		if f.cancel != nil { // futures are made by issue; a hand-built one has nothing to cancel
+			f.cancel()
+		}
+	}
+	r.q = nil
+}
+
+// truncateAt records that the file ends at size: the read-ahead behind it asks for bytes that do not
+// exist, so it is dropped and its READs are cancelled.
+func (r *fileReader) truncateAt(size int64) {
+	r.size = size
+	r.dropQueue()
+	r.next = size
+}
+
 func (r *fileReader) reset(at int64) {
-	r.q = nil // outstanding goroutines finish into buffered channels and are dropped
+	r.dropQueue()
 	r.buf = nil
 	r.pos = at
 	r.next = at
@@ -201,7 +224,7 @@ func (r *fileReader) reset(at int64) {
 // caller clears the error with Seek and reads again.
 func (r *fileReader) fail(err error) error {
 	r.err = err
-	r.q = nil
+	r.dropQueue()
 	r.buf = nil
 	r.next = r.pos
 	return err
@@ -246,7 +269,7 @@ func (r *fileReader) Read(p []byte) (int, error) {
 		}
 		if len(res.data) == 0 {
 			if res.eof {
-				r.size = r.pos // the file is shorter than GETATTR said
+				r.truncateAt(r.pos) // the file is shorter than GETATTR said
 				return 0, io.EOF
 			}
 			return 0, r.fail(fmt.Errorf("%w: READ at offset %d returned 0 bytes without EOF", ErrNotProgressing, f.off))
@@ -258,9 +281,7 @@ func (r *fileReader) Read(p []byte) (int, error) {
 			r.grow()
 		case res.eof:
 			// Short because the file ends here: nothing beyond this offset exists.
-			r.size = f.off + int64(got)
-			r.q = nil
-			r.next = r.size
+			r.truncateAt(f.off + int64(got))
 		default:
 			// Short for another reason, typically the server's maximum reply size (rtmax) is
 			// below what was asked. The prefetches behind this one are still at valid offsets
@@ -315,7 +336,7 @@ func (r *fileReader) Close() error {
 	r.cancel() // first: unblocks a Read that is waiting for a READ reply
 	r.mu.Lock()
 	r.closed = true
-	r.q = nil
+	r.dropQueue()
 	r.buf = nil
 	r.mu.Unlock()
 	return nil

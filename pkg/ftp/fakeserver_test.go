@@ -123,9 +123,11 @@ func newFakeServer(t *testing.T) *fakeServer {
 			"/data/Čšž_日本.txt": {data: []byte("utf8"), mtime: t0},
 		},
 	}
+	resetLoginBackoffs() // the login back-off is process-wide and keyed by host:port: a reused ephemeral port must not inherit one
 	s.wg.Add(1)
 	go s.acceptLoop()
 	t.Cleanup(func() {
+		resetLoginBackoffs()
 		_ = ln.Close()
 		s.mu.Lock()
 		for _, c := range s.conns {

@@ -260,9 +260,7 @@ func TestAliveTimesOutOnASilentPeer(t *testing.T) {
 	c.mu.Lock()
 	cn := c.cur
 	c.mu.Unlock()
-	old := probeTimeout
-	probeTimeout = 300 * time.Millisecond
-	defer func() { probeTimeout = old }()
+	cn.aliveTimeout = 300 * time.Millisecond // alive() is bounded by KeepAliveTimeout (fix-r3), which the connection carries
 	p.hole.Store(true)
 	start := time.Now()
 	assert.False(t, cn.alive(), "a peer that stopped answering is not alive")

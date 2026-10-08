@@ -34,7 +34,9 @@ func mustBudget(t testing.TB, max int, rate float64, clk fabric.Clock) *fabric.H
 
 // ---------------------------------------------------------------- Limited
 
-func TestLimited_EveryOpTakesOneSlotExceptDisconnectAndTestConnection(t *testing.T) {
+// Round 3 (N2): TestConnection is budgeted too (taken without waiting, see
+// TestR3_Limited_Probe*); only Disconnect is exempt.
+func TestLimited_EveryOpTakesOneSlotExceptDisconnect(t *testing.T) {
 	t.Parallel()
 	for _, op := range fabric.AllOps() {
 		b := mustBudget(t, 3, 1e6, nil)
@@ -44,8 +46,8 @@ func TestLimited_EveryOpTakesOneSlotExceptDisconnectAndTestConnection(t *testing
 			t.Fatalf("%v: %v", op, err)
 		}
 		want := uint64(1)
-		if op == fabric.OpDisconnect || op == fabric.OpTestConnection {
-			want = 0 // never throttled: closing, and the pool's health probe
+		if op == fabric.OpDisconnect {
+			want = 0 // never throttled: closing a connection must always be possible
 		}
 		if got := b.Stats().Acquired; got != want {
 			t.Errorf("%v acquired %d slots, want %d", op, got, want)

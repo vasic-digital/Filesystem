@@ -242,6 +242,7 @@ func TestIntegration_Seekable_WholeFileAndSeeks_NoTruncation(t *testing.T) {
 	require.NoError(t, err)
 	defer sk.Close()
 	for _, off := range []int64{0, 1, 65536, 500000, f.bSize - 100, 4096} {
+		step := time.Now()
 		want := make([]byte, 100)
 		r, err := ref.ReadFileFrom(ictx(t), "sub/b.bin", off)
 		require.NoError(t, err)
@@ -254,6 +255,11 @@ func TestIntegration_Seekable_WholeFileAndSeeks_NoTruncation(t *testing.T) {
 		_, err = io.ReadFull(sk, got)
 		require.NoError(t, err)
 		assert.Equal(t, want, got, "seek to %d", off)
+		// WF24 G5: pure-ftpd sometimes never answers a download closed after a few bytes (measured against this very server:
+		// 30 s = the IOTimeout, for REST 1, 2 of 2 isolated runs of the committed code). The early close is bounded by
+		// earlyCloseWait (3 s) and a dropped connection is re-dialled (this server's login costs about 1.7 s); a step that takes
+		// longer than 15 s is the stall again and must fail the test instead of passing silently.
+		assert.Less(t, time.Since(step), 15*time.Second, "seek to %d took %v: the early-close stall of WF24 G5", off, time.Since(step))
 	}
 }
 

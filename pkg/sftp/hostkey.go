@@ -499,3 +499,41 @@ func Pin(ctx context.Context, store PinStore, host string, port int, conf Confir
 // (typically a FilePinStore). It is nil by default, so a factory-built client refuses every host until a store
 // with a confirmed pin is installed (ErrNoPinStore).
 var DefaultPinStore PinStore
+
+// DefaultPinStoreRef returns a PinStore that follows DefaultPinStore AT CALL TIME. The factory hands it to the clients it creates, so
+// a store the application installs after a client was created (but before it connects) is used; until one is installed every
+// lookup fails with ErrNoPinStore, exactly like a client created without a store.
+func DefaultPinStoreRef() PinStore { return defaultPinStoreRef{} }
+
+type defaultPinStoreRef struct{}
+
+func (defaultPinStoreRef) store() (PinStore, error) {
+	if s := DefaultPinStore; s != nil {
+		return s, nil
+	}
+	return nil, ErrNoPinStore
+}
+
+func (r defaultPinStoreRef) Lookup(hostport string) ([]HostKeyPin, error) {
+	s, err := r.store()
+	if err != nil {
+		return nil, err
+	}
+	return s.Lookup(hostport)
+}
+
+func (r defaultPinStoreRef) Record(hostport string, pin HostKeyPin) error {
+	s, err := r.store()
+	if err != nil {
+		return err
+	}
+	return s.Record(hostport, pin)
+}
+
+func (r defaultPinStoreRef) Remove(hostport, fingerprint string) error {
+	s, err := r.store()
+	if err != nil {
+		return err
+	}
+	return s.Remove(hostport, fingerprint)
+}

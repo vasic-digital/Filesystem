@@ -196,7 +196,7 @@ func TestGoNFSAuthSysCredentialIsWellFormed(t *testing.T) {
 		t.Fatal(err)
 	}
 	p, _ := strconv.Atoi(ps)
-	c, err := New(Config{Host: host, Export: "/", MountPort: p, NFSPort: p, UID: 1000, GID: 1000, GIDs: []uint32{4, 24, 1000}, CallTimeout: 10 * time.Second})
+	c, err := New(Config{Host: host, Export: "/", MountPort: p, NFSPort: p, UID: 1234, GID: 2345, GIDs: []uint32{4, 24, 3456}, CallTimeout: 10 * time.Second})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,8 @@ func TestGoNFSAuthSysCredentialIsWellFormed(t *testing.T) {
 			t.Errorf("no verified credential for %q\n%s", want, log)
 		}
 	}
-	if !strings.Contains(log, "gids=3") || !strings.Contains(log, "uid=1000 gid=1000 machine=catalogizer") {
+	// DISTINCT uid, gid and gid values (the fixture is started with -authuid 1234 -authgid 2345 -authgids 4,24,3456): the oracle must see a swap or a shift.
+	if !strings.Contains(log, "uid=1234 gid=2345 machine=catalogizer gids=4,24,3456") {
 		t.Errorf("the verified credentials do not carry the configured identity:\n%s", log)
 	}
 }
