@@ -23,3 +23,5 @@ This is a `vasic-digital` / `HelixDevelopment` submodule for the parent project.
 ## Git topology
 `origin` fetch=GitHub, push=GitFlic. Four remotes configured.
 Force-push requires explicit authorization. `--no-verify` is forbidden.
+
+Dependency manifest: `helix-deps.yaml` (§11.4.31) declares this submodule's own-org dependencies (none; leaf module).

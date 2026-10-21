@@ -252,3 +252,5 @@ no-versioned-build-artifacts) from the constitution submodule. See
 ## License
 
 See the parent project for licensing terms.
+
+Dependency manifest: `helix-deps.yaml` (§11.4.31) declares this submodule's own-org dependencies (none; leaf module).

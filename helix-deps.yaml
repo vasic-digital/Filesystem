@@ -1,0 +1,19 @@
+# helix-deps.yaml — filesystem Submodule-Dependency Manifest
+# Per HelixConstitution §11.4.31 (Submodule-Dependency-Manifest Mandate).
+#
+# Filesystem (digital.vasic.filesystem), a Go multi-protocol filesystem client. It has ZERO own-org
+# (vasic-digital / HelixDevelopment) submodule dependencies: go.mod requires
+# only third-party modules and no source file imports another digital.vasic.*
+# module. The empty deps array is the honest manifest for a leaf submodule.
+#
+# Schema reference: <constitution-submodule>/Constitution.md §11.4.31.
+
+schema_version: 1
+
+deps: []
+
+transitive_handling:
+  recursive: true
+  conflict_resolution: operator-required
+
+language_specific_subtree: false

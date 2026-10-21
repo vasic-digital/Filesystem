@@ -22,3 +22,5 @@ directive. Qwen Code's memory-import processor resolves import-prefixed tokens
 recursively, and the instruction files reference tokens that are not files. To
 stay compatible with Qwen Code this file contains no such tokens — read
 CLAUDE.md directly.
+
+Dependency manifest: `helix-deps.yaml` (§11.4.31) declares this submodule's own-org dependencies (none; leaf module).

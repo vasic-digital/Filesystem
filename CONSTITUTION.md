@@ -9,3 +9,5 @@ unconditionally. Locate the constitution from any nested depth via its
 fully decoupled and project-agnostic per §11.4.28).
 
 Canonical reference: https://github.com/HelixDevelopment/HelixConstitution
+
+Dependency manifest: `helix-deps.yaml` (§11.4.31) declares this submodule's own-org dependencies (none; leaf module).
