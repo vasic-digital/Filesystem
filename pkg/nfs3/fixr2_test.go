@@ -908,8 +908,10 @@ func TestListingOfOnlyVanishingEntriesTerminates(t *testing.T) {
 	ctx, cancel := context.WithTimeout(bg, 10*time.Second)
 	defer cancel()
 	_, err := c.ListDirectory(ctx, "/docs")
-	if !errors.Is(err, ErrNotProgressing) {
-		t.Fatalf("want ErrNotProgressing from the page cap, got %v after %d calls", err, calls.Load())
+	// NFS3RDFU-m1: the entry cap now counts entries attempted, so the all-vanishing loop ends with the cap error
+	// (after 31 entries) before the page cap (38 pages) can be reached.
+	if err == nil || !strings.Contains(err.Error(), "more than 30 entries") {
+		t.Fatalf("want the entry-cap error, got %v after %d calls", err, calls.Load())
 	}
 	if n := calls.Load(); n > 40 {
 		t.Errorf("%d pages for MaxEntries=30", n)

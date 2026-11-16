@@ -184,6 +184,9 @@ const maxPipelineLimit = 64
 
 // validate refuses limits that cannot work together.
 func (c *Config) validate() error {
+	if c.FallbackMaxEntries < 0 {
+		return fmt.Errorf("nfs3: FallbackMaxEntries %d is negative (0 keeps MaxEntries for the READDIR fallback)", c.FallbackMaxEntries)
+	}
 	if c.MaxPipeline > maxPipelineLimit {
 		return fmt.Errorf("nfs3: MaxPipeline %d exceeds the limit %d (every in-flight READ can hold up to 1 MiB)", c.MaxPipeline, maxPipelineLimit)
 	}
@@ -1155,6 +1158,7 @@ func (c *Client) listOnce(ctx context.Context, dir Handle, cp string, plain bool
 		verf         [8]byte
 		out          []*client.FileInfo
 		dotOnlyPages int
+		attempted    int // entries examined, kept or vanished: the cap bounds this, not len(out)
 	)
 	// A cookie that was already used as a request cookie means the server is not advancing (a page
 	// that does not move the cookie asks for the same cookie again on the next round): stop
@@ -1207,9 +1211,12 @@ func (c *Client) listOnce(ctx context.Context, dir Handle, cp string, plain bool
 				return nil, fmt.Errorf("%w: server returned entry name %q", ErrBadXDR, en.Name)
 			}
 			real++
-			if len(out) >= limit {
+			// Count every entry the server offers, kept or not: a server whose entry LOOKUPs all answer NOENT
+			// would otherwise keep len(out) at 0 and bypass the cap (NFS3RDFU-m1).
+			if attempted >= limit {
 				return nil, fmt.Errorf("nfs3: directory %q has more than %d entries", cp, limit)
 			}
+			attempted++
 			var a Attr
 			if en.Attr != nil {
 				a = *en.Attr
