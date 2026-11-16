@@ -23,6 +23,13 @@
 // sees nothing: MNT and UMNT add and remove the server's mount record (rmtab), and READ
 // updates access times on exports that do not mount with noatime.
 //
+// # READDIR fallback cost
+//
+// A server without READDIRPLUS (NFS3ERR_NOTSUPP / PROC_UNAVAIL) is listed with plain READDIR, which carries no
+// attributes: every entry then costs one LOOKUP, plus one GETATTR when the LOOKUP reply carries no attributes. A
+// listing is therefore up to Config.MaxEntries (default 5,000,000) round trips per directory against a hostile or
+// huge server. Config.FallbackMaxEntries (0 = off, the default) lowers that cap for fallback listings only.
+//
 // # Reserved source ports
 //
 // Many NAS products export with the "secure" option (the client's TCP source port must be

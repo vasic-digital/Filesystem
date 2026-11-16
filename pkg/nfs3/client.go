@@ -101,7 +101,11 @@ type Config struct {
 	DirCount    uint32 // READDIRPLUS dircount; default 32768
 	DirMaxCount uint32 // READDIRPLUS maxcount; default 131072
 	MaxEntries  int    // cap on entries per directory listing; default 5,000,000
-	MaxRecord   int    // cap on one RPC record; default 8 MiB. ReadSize and DirMaxCount (plus 4 KiB) must fit in it
+	// FallbackMaxEntries lowers MaxEntries for listings done with plain READDIR (the fallback for servers
+	// without READDIRPLUS), where every entry costs one LOOKUP (+ one GETATTR when the LOOKUP carries no
+	// attributes). 0 (default) keeps MaxEntries for the fallback too; a value above MaxEntries has no effect.
+	FallbackMaxEntries int
+	MaxRecord          int // cap on one RPC record; default 8 MiB. ReadSize and DirMaxCount (plus 4 KiB) must fit in it
 
 	// TryPrivilegedPort: when Connect fails with an access error (MOUNT, or the first NFS
 	// calls: MNT3ERR_ACCES/PERM, NFS3ERR_ACCES/PERM, RPC AUTH_ERROR) from an unprivileged
@@ -1156,6 +1160,10 @@ func (c *Client) listOnce(ctx context.Context, dir Handle, cp string, plain bool
 	// that does not move the cookie asks for the same cookie again on the next round): stop
 	// instead of looping against the NAS.
 	usedReq := map[uint64]struct{}{}
+	limit := c.cfg.MaxEntries
+	if plain && c.cfg.FallbackMaxEntries > 0 && c.cfg.FallbackMaxEntries < limit {
+		limit = c.cfg.FallbackMaxEntries
+	}
 	maxPages := c.cfg.MaxEntries
 	if maxPages < math.MaxInt-8 {
 		maxPages += 8
@@ -1199,8 +1207,8 @@ func (c *Client) listOnce(ctx context.Context, dir Handle, cp string, plain bool
 				return nil, fmt.Errorf("%w: server returned entry name %q", ErrBadXDR, en.Name)
 			}
 			real++
-			if len(out) >= c.cfg.MaxEntries {
-				return nil, fmt.Errorf("nfs3: directory %q has more than %d entries", cp, c.cfg.MaxEntries)
+			if len(out) >= limit {
+				return nil, fmt.Errorf("nfs3: directory %q has more than %d entries", cp, limit)
 			}
 			var a Attr
 			if en.Attr != nil {
