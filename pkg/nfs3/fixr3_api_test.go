@@ -50,8 +50,8 @@ func TestFixR3VanishedErrDependsOnTheLeg(t *testing.T) {
 
 func TestFixR3AllowListKeysCarryTheRightVersion(t *testing.T) {
 	want := map[uint32]uint32{progPortmap: versPortmap, progMount: versMount, progNFS: versNFS}
-	if len(allowedCalls) != 11 {
-		t.Errorf("%d allowed procedures, want 11 (portmap GETPORT; MOUNT MNT UMNT EXPORT; NFS NULL GETATTR LOOKUP ACCESS READ READDIRPLUS FSINFO)", len(allowedCalls))
+	if len(allowedCalls) != 12 {
+		t.Errorf("%d allowed procedures, want 12 (portmap GETPORT; MOUNT MNT UMNT EXPORT; NFS NULL GETATTR LOOKUP ACCESS READ READDIR READDIRPLUS FSINFO)", len(allowedCalls))
 	}
 	for k := range allowedCalls {
 		if v, ok := want[k.prog]; !ok || k.vers != v {

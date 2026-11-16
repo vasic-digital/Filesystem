@@ -226,7 +226,7 @@ func TestKillA10ReadSizeCapped(t *testing.T) {
 // A11: every RPC issued by the package names an allow-listed procedure identifier (no literal, no other name).
 func TestKillA11OnlyAllowListedProcsReachTheWire(t *testing.T) {
 	allowed := map[string]bool{"procNull": true, "procGetattr": true, "procLookup": true, "procAccess": true, "procRead": true,
-		"procReaddirplus": true, "procFsinfo": true, "procMnt": true, "procUmnt": true, "procMntExport": true, "procPmapGetport": true,
+		"procReaddir": true, "procReaddirplus": true, "procFsinfo": true, "procMnt": true, "procUmnt": true, "procMntExport": true, "procPmapGetport": true,
 		"proc": true} // "proc" = the forwarded parameter inside callNFS/oneShot/call themselves
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool { return !strings.HasSuffix(fi.Name(), "_test.go") }, 0)

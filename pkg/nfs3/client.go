@@ -218,12 +218,13 @@ type Client struct {
 	fsinfo     FSInfo
 	cache      map[string]cacheEntry // directory path -> handle
 
-	xid         atomic.Uint32    // one xid sequence for every connection of this client
-	lastNFSPort atomic.Int64     // local port of the most recent NFS connection
-	vanished    atomic.Int64     // listing entries that disappeared between READDIRPLUS and LOOKUP
-	remountSem  chan struct{}    // one remount at a time; a channel so that a waiter honours its context
-	cacheGen    uint64           // last handle-cache generation handed out (under mu)
-	now         func() time.Time // clock of the handle cache (tests replace it)
+	xid           atomic.Uint32    // one xid sequence for every connection of this client
+	lastNFSPort   atomic.Int64     // local port of the most recent NFS connection
+	noReaddirplus atomic.Bool      // the server answered READDIRPLUS with NFS3ERR_NOTSUPP / PROC_UNAVAIL: list with READDIR
+	vanished      atomic.Int64     // listing entries that disappeared between READDIRPLUS and LOOKUP
+	remountSem    chan struct{}    // one remount at a time; a channel so that a waiter honours its context
+	cacheGen      uint64           // last handle-cache generation handed out (under mu)
+	now           func() time.Time // clock of the handle cache (tests replace it)
 }
 
 // cacheEntry is one remembered directory handle and when it was learned. gen identifies the
@@ -1067,7 +1068,11 @@ func (c *Client) Access(ctx context.Context, p string, mask uint32) (uint32, err
 }
 
 // ListDirectory lists p with READDIRPLUS, paged with the cookie and cookie
-// verifier. "." and ".." are omitted.
+// verifier. "." and ".." are omitted. A server that does not implement READDIRPLUS (NFS3ERR_NOTSUPP, or the
+// RPC answer PROC_UNAVAIL for procedure 17; unfs3 answers NOTSUPP) is listed with plain READDIR (procedure 16)
+// instead, with the same paging; READDIR carries no attributes, so each entry's attributes come from the
+// LOOKUP / GETATTR fallback that listOnce already uses for entryplus3 entries without attributes. No other
+// error triggers the fallback. The decision is remembered per Client.
 func (c *Client) ListDirectory(ctx context.Context, p string) ([]*client.FileInfo, error) {
 	dir, attr, cp, err := c.resolve(ctx, p)
 	if err != nil {
@@ -1077,13 +1082,32 @@ func (c *Client) ListDirectory(ctx context.Context, p string) ([]*client.FileInf
 		return nil, &NFSError{Op: "READDIRPLUS", Status: NFS3ErrNotDir}
 	}
 	for restart := 0; ; restart++ {
-		out, err := c.listOnce(ctx, dir, cp)
+		plain := c.noReaddirplus.Load()
+		out, err := c.listOnce(ctx, dir, cp, plain)
+		if err != nil && !plain && readdirplusUnsupported(err) {
+			c.noReaddirplus.Store(true)
+			out, err = c.listOnce(ctx, dir, cp, true)
+		}
 		var ne *NFSError
 		if errors.As(err, &ne) && ne.Status == NFS3ErrBadCookie && restart < 2 {
 			continue // the directory changed under the cookie: start over (RFC 1813 3.3.17)
 		}
 		return out, err
 	}
+}
+
+// readdirplusUnsupported reports that the server does not implement READDIRPLUS: NFS3ERR_NOTSUPP from
+// the READDIRPLUS call itself (not from any other procedure), or the RPC accept status PROC_UNAVAIL for it.
+func readdirplusUnsupported(err error) bool {
+	var ne *NFSError
+	if errors.As(err, &ne) {
+		return ne.Op == "READDIRPLUS" && ne.Status == NFS3ErrNotSupp
+	}
+	var re *RPCError
+	if errors.As(err, &re) {
+		return re.Proc == procReaddirplus && !re.Denied && re.AcceptStat == acceptProcUnavail
+	}
+	return false
 }
 
 // attrLeg names the procedure of the attribute fallback of a listing whose error is being judged.
@@ -1117,7 +1141,11 @@ func vanishedErr(err error, leg attrLeg) bool {
 	return false
 }
 
-func (c *Client) listOnce(ctx context.Context, dir Handle, cp string) ([]*client.FileInfo, error) {
+func (c *Client) listOnce(ctx context.Context, dir Handle, cp string, plain bool) ([]*client.FileInfo, error) {
+	procName := "READDIRPLUS"
+	if plain {
+		procName = "READDIR"
+	}
 	var (
 		cookie       uint64
 		verf         [8]byte
@@ -1134,18 +1162,29 @@ func (c *Client) listOnce(ctx context.Context, dir Handle, cp string) ([]*client
 	}
 	for pages := 0; ; pages++ {
 		if pages > maxPages {
-			return nil, fmt.Errorf("%w: READDIRPLUS of %q needed more than %d pages", ErrNotProgressing, cp, maxPages)
+			return nil, fmt.Errorf("%w: %s of %q needed more than %d pages", ErrNotProgressing, procName, cp, maxPages)
 		}
 		reqCookie := cookie
 		if _, dup := usedReq[reqCookie]; dup {
-			return nil, fmt.Errorf("%w: READDIRPLUS of %q asked for cookie %d a second time", ErrNotProgressing, cp, reqCookie)
+			return nil, fmt.Errorf("%w: %s of %q asked for cookie %d a second time", ErrNotProgressing, procName, cp, reqCookie)
 		}
 		usedReq[reqCookie] = struct{}{}
-		res, err := c.callNFS(ctx, procReaddirplus, encodeReaddirplus(dir, cookie, verf, c.cfg.DirCount, c.cfg.DirMaxCount), "READDIRPLUS")
+		var res []byte
+		var err error
+		var pg dirPage
+		if plain {
+			res, err = c.callNFS(ctx, procReaddir, encodeReaddir(dir, cookie, verf, c.cfg.DirCount), "READDIR")
+		} else {
+			res, err = c.callNFS(ctx, procReaddirplus, encodeReaddirplus(dir, cookie, verf, c.cfg.DirCount, c.cfg.DirMaxCount), "READDIRPLUS")
+		}
 		if err != nil {
 			return nil, err
 		}
-		pg, err := decodeReaddirplus(res)
+		if plain {
+			pg, err = decodeReaddir(res)
+		} else {
+			pg, err = decodeReaddirplus(res)
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -1198,12 +1237,12 @@ func (c *Client) listOnce(ctx context.Context, dir Handle, cp string) ([]*client
 			return out, nil
 		}
 		if len(pg.Entries) == 0 {
-			return nil, fmt.Errorf("%w: READDIRPLUS returned no entries and no EOF", ErrNotProgressing)
+			return nil, fmt.Errorf("%w: %s returned no entries and no EOF", ErrNotProgressing, procName)
 		}
 		if real == 0 {
 			// "." and ".." are two entries: more than two pages made of nothing else is a loop.
 			if dotOnlyPages++; dotOnlyPages > 2 {
-				return nil, fmt.Errorf("%w: READDIRPLUS keeps returning only '.' and '..'", ErrNotProgressing)
+				return nil, fmt.Errorf("%w: %s keeps returning only '.' and '..'", ErrNotProgressing, procName)
 			}
 		}
 	}

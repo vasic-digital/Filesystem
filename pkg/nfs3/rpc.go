@@ -199,6 +199,7 @@ var allowedCalls = map[callKey]bool{
 	{progNFS, versNFS, procLookup}:              true,
 	{progNFS, versNFS, procAccess}:              true,
 	{progNFS, versNFS, procRead}:                true,
+	{progNFS, versNFS, procReaddir}:             true,
 	{progNFS, versNFS, procReaddirplus}:         true,
 	{progNFS, versNFS, procFsinfo}:              true,
 }

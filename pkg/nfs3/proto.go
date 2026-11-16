@@ -16,6 +16,7 @@ const (
 	procLookup      = 3
 	procAccess      = 4
 	procRead        = 6
+	procReaddir     = 16
 	procReaddirplus = 17
 	procFsinfo      = 19
 
@@ -532,6 +533,60 @@ func decodeRead(b []byte, asked uint32) ([]byte, bool, error) {
 		return nil, false, fmt.Errorf("%w: READ count %d does not match data length %d", ErrBadXDR, cnt, len(data))
 	}
 	return data, eof, nil
+}
+
+// encodeReaddir builds READDIR3args (RFC 1813 section 3.3.16): dir, cookie, cookieverf, count.
+func encodeReaddir(dir Handle, cookie uint64, verf [8]byte, count uint32) []byte {
+	var e encoder
+	e.opaque(dir)
+	e.u64(cookie)
+	e.fixed(verf[:])
+	e.u32(count)
+	return e.b
+}
+
+// decodeReaddir decodes READDIR3res (RFC 1813 section 3.3.16). entry3 carries only fileid, name and
+// cookie, so every DirEntry has a nil Attr and a nil Handle.
+func decodeReaddir(b []byte) (dirPage, error) {
+	var pg dirPage
+	d := newDecoder(b)
+	if err := d.status("READDIR"); err != nil {
+		return pg, err
+	}
+	if _, err := d.postOpAttr(); err != nil {
+		return pg, err
+	}
+	if d.remaining() < 8 {
+		return pg, ErrShortXDR
+	}
+	copy(pg.Verf[:], d.b[d.off:d.off+8])
+	d.off += 8
+	for {
+		more, err := d.boolean()
+		if err != nil {
+			return pg, err
+		}
+		if !more {
+			break
+		}
+		var en DirEntry
+		if en.FileID, err = d.u64(); err != nil {
+			return pg, err
+		}
+		if en.Name, err = d.str(nameMax); err != nil {
+			return pg, err
+		}
+		if en.Cookie, err = d.u64(); err != nil {
+			return pg, err
+		}
+		pg.Entries = append(pg.Entries, en)
+	}
+	eof, err := d.boolean()
+	if err != nil {
+		return pg, err
+	}
+	pg.EOF = eof
+	return pg, nil
 }
 
 func encodeReaddirplus(dir Handle, cookie uint64, verf [8]byte, dircount, maxcount uint32) []byte {

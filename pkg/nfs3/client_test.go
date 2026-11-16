@@ -465,7 +465,7 @@ func TestAccessAndReadOnly(t *testing.T) {
 	if n := s.writeProcCalls(); n != 0 {
 		t.Fatalf("server saw %d write-class procedure calls", n)
 	}
-	allowed := map[int]bool{procNull: true, procGetattr: true, procLookup: true, procAccess: true, procRead: true, procReaddirplus: true, procFsinfo: true}
+	allowed := map[int]bool{procNull: true, procGetattr: true, procLookup: true, procAccess: true, procRead: true, procReaddir: true, procReaddirplus: true, procFsinfo: true}
 	for p := range s.procs {
 		if s.procs[p].Load() > 0 && !allowed[p] {
 			t.Errorf("procedure %d was called", p)
@@ -502,7 +502,7 @@ func TestNoWriteProcedureCompiledIn(t *testing.T) {
 			})
 		}
 	}
-	want := []string{"procNull", "procGetattr", "procLookup", "procAccess", "procRead", "procReaddirplus", "procFsinfo",
+	want := []string{"procNull", "procGetattr", "procLookup", "procAccess", "procRead", "procReaddir", "procReaddirplus", "procFsinfo",
 		"procMntNull", "procMnt", "procUmnt", "procMntExport", "procPmapGetport"}
 	var got []string
 	for k := range found {

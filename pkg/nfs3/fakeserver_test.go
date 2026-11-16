@@ -55,27 +55,30 @@ type fakeServer struct {
 }
 
 type fakeOpts struct {
-	PortOK        func(remotePort int) bool // nil = accept all
-	MaxRead       int                       // clamp bytes returned per READ (short reads)
-	PageEntries   int                       // max entries per READDIRPLUS page (0 = fill dircount)
-	OmitAttrs     bool                      // entryplus3 without name_attributes
-	OmitHandles   bool                      // entryplus3 without handle
-	DropEveryN    int                       // close the nfs connection before answering every Nth call
-	Jukebox       int                       // answer the next N NFS calls with NFS3ERR_JUKEBOX
-	BadCookieOnce bool                      // answer first resumed READDIRPLUS with BAD_COOKIE and bump the verifier
-	StaleOnce     bool                      // answer the first LOOKUP of a cached parent with STALE
-	Shuffle       bool                      // answer pipelined calls out of order
-	Delay         time.Duration             // per-call delay
-	NoReply       bool                      // never answer NFS calls
-	Corrupt       func(proc uint32, reply []byte) []byte
-	AuthFlavors   []uint32
-	WrongXID      bool // reply with xid+1 first, then the right one
-	FSInfoRTPref  uint32
-	FSInfoRTMax   uint32 // 0 = 1 MiB
-	ShortAtRead   int    // the Nth READ (1-based, counted from server start) is answered with half of its data
-	RPCDeny       int    // 0 none, 1 AUTH_ERROR on NFS calls, 2 RPC_MISMATCH
-	MountStatus   uint32
-	NFSNotListed  bool // portmapper returns 0 for NFS
+	PortOK          func(remotePort int) bool // nil = accept all
+	MaxRead         int                       // clamp bytes returned per READ (short reads)
+	PageEntries     int                       // max entries per READDIRPLUS page (0 = fill dircount)
+	OmitAttrs       bool                      // entryplus3 without name_attributes
+	OmitHandles     bool                      // entryplus3 without handle
+	DropEveryN      int                       // close the nfs connection before answering every Nth call
+	Jukebox         int                       // answer the next N NFS calls with NFS3ERR_JUKEBOX
+	PlusStatus      uint32                    // answer every READDIRPLUS with this NFS status (e.g. NFS3ErrNotSupp)
+	PlusProcUnavail bool                      // answer READDIRPLUS with RPC accept status PROC_UNAVAIL
+	PlainStatus     uint32                    // answer every READDIR with this NFS status
+	BadCookieOnce   bool                      // answer first resumed READDIRPLUS with BAD_COOKIE and bump the verifier
+	StaleOnce       bool                      // answer the first LOOKUP of a cached parent with STALE
+	Shuffle         bool                      // answer pipelined calls out of order
+	Delay           time.Duration             // per-call delay
+	NoReply         bool                      // never answer NFS calls
+	Corrupt         func(proc uint32, reply []byte) []byte
+	AuthFlavors     []uint32
+	WrongXID        bool // reply with xid+1 first, then the right one
+	FSInfoRTPref    uint32
+	FSInfoRTMax     uint32 // 0 = 1 MiB
+	ShortAtRead     int    // the Nth READ (1-based, counted from server start) is answered with half of its data
+	RPCDeny         int    // 0 none, 1 AUTH_ERROR on NFS calls, 2 RPC_MISMATCH
+	MountStatus     uint32
+	NFSNotListed    bool // portmapper returns 0 for NFS
 }
 
 func newFakeServer(t *testing.T) *fakeServer {
@@ -582,7 +585,21 @@ func (s *fakeServer) nfs(prog, vers, proc uint32, args []byte, rport int, o fake
 		e.u32(uint32(len(data)))
 		e.boolean(eof)
 		e.opaque(data)
-	case procReaddirplus:
+	case procReaddir, procReaddirplus:
+		plus := proc == procReaddirplus
+		if plus && o.PlusProcUnavail {
+			return nil, acceptProcUnavail
+		}
+		if st := o.PlusStatus; plus && st != 0 {
+			e.u32(st)
+			e.boolean(false)
+			return e.b, 99
+		}
+		if st := o.PlainStatus; !plus && st != 0 {
+			e.u32(st)
+			e.boolean(false)
+			return e.b, 99
+		}
 		fh, _ := d.opaque(64)
 		cookie, _ := d.u64()
 		var verf [8]byte
@@ -642,6 +659,11 @@ func (s *fakeServer) nfs(prog, vers, proc uint32, args []byte, rport int, o fake
 			e.u64(en.n.id)
 			e.str(en.name)
 			e.u64(en.cookie)
+			if !plus {
+				sent++
+				budget -= 100
+				continue
+			}
 			if o.OmitAttrs {
 				e.boolean(false)
 			} else {
