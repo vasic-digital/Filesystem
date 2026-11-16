@@ -5,6 +5,7 @@ package nfs3
 // FallbackMaxEntries rejected). Not evidence about a real server.
 
 import (
+	"math"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -56,7 +57,8 @@ func TestNFS3RDFUm1_AllNoentCannotBypassCap(t *testing.T) {
 	}
 }
 
-// m1, same bypass on the READDIRPLUS-without-attributes path is covered by MaxEntries: all-NOENT with MaxEntries 10.
+// m1, same bypass with MaxEntries (not FallbackMaxEntries) as the cap: all-NOENT with MaxEntries 10 over plain
+// READDIR (PlusStatus=NotSupp makes the client fall back; NFS3RDFUFU-n1 corrected this comment).
 func TestNFS3RDFUm1_AllNoentCannotBypassMaxEntries(t *testing.T) {
 	s := newFakeServer(t)
 	s.set(func(o *fakeOpts) { o.PlusStatus = NFS3ErrNotSupp })
@@ -106,5 +108,51 @@ func TestNFS3RDFUn1_NegativeFallbackMaxEntriesRejected(t *testing.T) {
 	}
 	if _, err := New(Config{Host: "h", Export: "/x", FallbackMaxEntries: 0}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// NFS3RDFUFU-m1: near the cap with honestly vanished entries. Cap 250 on /many (250 entries), 3 of them NOENT:
+// listing must succeed with 247. Mutant "vanished LOOKUP counted twice" makes attempted reach 253 > 250.
+func TestNFS3RDFUFUm1_NearCapHonestVanishedStillLists(t *testing.T) {
+	s := newFakeServer(t)
+	c := fallbackClient(t, s, 250)
+	var n atomic.Int64
+	noentLookups(s, 3, &n)
+	l, err := c.ListDirectory(bg, "/many")
+	if err != nil {
+		t.Fatalf("near-cap listing with 3 vanished failed: %v", err)
+	}
+	if len(l) != 247 || c.vanished.Load() != 3 {
+		t.Fatalf("listed %d vanished %d, want 247 / 3", len(l), c.vanished.Load())
+	}
+}
+
+// NFS3RDFUFU-m2: every negative FallbackMaxEntries is rejected, not just -1.
+func TestNFS3RDFUFUm2_AllNegativesRejected(t *testing.T) {
+	for _, v := range []int{-1, -2, -1000, math.MinInt} {
+		if _, err := New(Config{Host: "h", Export: "/x", FallbackMaxEntries: v}); err == nil || !strings.Contains(err.Error(), "FallbackMaxEntries") {
+			t.Errorf("FallbackMaxEntries %d: err=%v", v, err)
+		}
+	}
+}
+
+// NFS3RDFUFU-n2/n3: the cap error says "offered more than" (vanished entries count too) and quotes the path with
+// %q (a control character is escaped, not emitted raw). Drives the real listOnce with a path carrying BEL+newline.
+func TestNFS3RDFUFUn2n3_CapErrorWordingAndQuoting(t *testing.T) {
+	s := newFakeServer(t)
+	c := fallbackClient(t, s, 10)
+	dir, _, err := c.walk(bg, "/many")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.listOnce(bg, dir, "/ma\a\nny", true)
+	if err == nil {
+		t.Fatal("want cap error")
+	}
+	if !strings.Contains(err.Error(), `"/ma\a\nny" offered more than 10 entries`) {
+		t.Fatalf("err=%q", err.Error())
+	}
+	if strings.ContainsAny(err.Error(), "\a\n") {
+		t.Fatalf("raw control character in %q", err.Error())
 	}
 }

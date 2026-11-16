@@ -1168,6 +1168,10 @@ func (c *Client) listOnce(ctx context.Context, dir Handle, cp string, plain bool
 	if plain && c.cfg.FallbackMaxEntries > 0 && c.cfg.FallbackMaxEntries < limit {
 		limit = c.cfg.FallbackMaxEntries
 	}
+	// maxPages is belt-and-braces (NFS3RDFUFU-m3): the attempted-entry cap above is reached first, because every
+	// page that is not "."/".."-only (at most 2 such pages are tolerated) offers at least one entry that counts
+	// against limit <= MaxEntries, so pages <= limit+3 < maxPages. It is kept as a second, independent bound in
+	// case the entry accounting is ever changed; it has no test of its own that can reach it.
 	maxPages := c.cfg.MaxEntries
 	if maxPages < math.MaxInt-8 {
 		maxPages += 8
@@ -1214,7 +1218,7 @@ func (c *Client) listOnce(ctx context.Context, dir Handle, cp string, plain bool
 			// Count every entry the server offers, kept or not: a server whose entry LOOKUPs all answer NOENT
 			// would otherwise keep len(out) at 0 and bypass the cap (NFS3RDFU-m1).
 			if attempted >= limit {
-				return nil, fmt.Errorf("nfs3: directory %q has more than %d entries", cp, limit)
+				return nil, fmt.Errorf("nfs3: directory %q offered more than %d entries", cp, limit)
 			}
 			attempted++
 			var a Attr
